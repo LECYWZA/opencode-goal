@@ -519,6 +519,7 @@ export default (async function plugin(input, rawOptions) {
   const store = new Store(options.state_file);
   const arbiter = new Arbiter(path.dirname(options.state_file));
   const runtimes = new Map<string, Runtime>();
+  const recentEdits = new Map<string, number>(); // file -> ts (real file.edited events)
   const log = (...args: unknown[]) => {
     if (options.debug) console.log("[goal-run]", ...args);
   };
@@ -600,7 +601,17 @@ export default (async function plugin(input, rawOptions) {
         : `[goal-run] Round ${runs}. Continue working toward: ${s.objective}. Do real work with tools. Call goal_progress when you make progress. Finish via goal_mark_done (do not stop without it).`;
 
     if (eff.worktree_policy === "parallel" || eff.worktree_parallel_sessions > 1) {
-      base += `\n[parallel] 同项目可能被其它会话/实例并行编辑——改现有文件前先读取最新内容，分工避重，改后 git status/diff 检查是否覆盖他人改动。`;
+      const _now = Date.now();
+      const _files = [...recentEdits.entries()]
+        .filter(([, _t]) => _now - _t < 30000)
+        .map(([_f]) => _f)
+        .slice(0, 6);
+      base +=
+        `\n[parallel] 同项目可能被其它会话/实例并行编辑。` +
+        (_files.length
+          ? ` 最近30s内有文件被改动(可能来自其它运行，操作前请先 read 最新内容再 Edit): ${_files.join("、")}。`
+          : "") +
+        ` 改现有文件前先读取最新内容，分工避重，改后 git status/diff 检查是否覆盖他人改动。`;
     }
 
     if (eff.recovery === "pause") return base;
@@ -776,6 +787,17 @@ export default (async function plugin(input, rawOptions) {
       if (event.type === "session.idle") {
         const sessionID = event.properties?.sessionID as string;
         if (getRuntime(sessionID)) scheduleContinue(sessionID);
+        return;
+      }
+      if (event.type === "file.edited") {
+        const f = event.properties?.file;
+        if (typeof f === "string" && f) {
+          recentEdits.set(f, Date.now());
+          if (recentEdits.size > 200) {
+            const _n = Date.now();
+            for (const [k, v] of recentEdits) if (_n - v > 5 * 60 * 1000) recentEdits.delete(k);
+          }
+        }
         return;
       }
       if (event.type === "message.part.updated") {
