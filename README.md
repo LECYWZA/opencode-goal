@@ -41,9 +41,9 @@ npm run build      # 改源码后必须重新构建
 
 config 里的参数只是**全局默认值**。每个任务实际生效的参数可以在运行时单独设置，优先级：**本次任务的覆盖 > 全局默认**。三种方式：
 
-1. **内联参数**（目标里直接带，如）：`/my_goal 做一个XX agent=3 max_turns=50 recovery=auto-research`
-   - 支持：`agent`(并行数) `max_turns`(-1=无限) `recovery`(auto-research/pause/continue) `recovery_attempts` `no_progress_turns` `converge_turns` `turn_timeout_s`(静默超时) `idle_interval_ms`
-2. **启动时弹选**：未在命令行指定时，命令会用 question 工具**逐项弹出选择**让你确认（并行 agent 数、是否限轮次、无进展处理策略、静默超时秒数），无需接触配置文件。
+1. **内联参数**（目标里直接带，如）：`/my_goal 做一个XX agent=3 max_turns=50 recovery=auto-research worktree_policy=parallel`
+   - 支持：`agent`(并行数) `max_turns`(-1=无限) `recovery`(auto-research/pause/continue) `recovery_attempts` `worktree_policy`(serial/parallel) `no_progress_turns` `converge_turns` `turn_timeout_s`(静默超时) `idle_interval_ms`
+2. **启动时弹选**：未在命令行指定时，命令会用 question 工具**逐项弹出选择**让你确认（并行 agent 数、是否限轮次、无进展处理策略、静默超时秒数、同项目并发策略），无需接触配置文件。
 3. **运行中调整**：随时让模型调用 `goal_configure(agent=…, max_turns=…, recovery=…, …)` 即可改动当前任务参数，不重置进度。
 
 任务级配置随状态一起落盘，跨重启恢复时保持。
@@ -60,6 +60,7 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 | `converge_turns` | `5` | 迭代模式：连续 N 轮无改进视为收敛 |
 | `recovery` | `auto-research` | 受挫时策略：自动分析+搜索+换思路继续 / 暂停等我 / 无条件硬继续 |
 | `recovery_attempts` | `4` | 自我进化恢复轮次上限，用尽仍无进展才暂停 |
+| `worktree_policy` | `serial` | 同项目并发：`serial`=同一工作目录互斥防冲突(默认) / `parallel`=可并行推进不互斥 |
 | `idle_interval_ms` | `2000` | 续跑最小间隔（去抖） |
 | `persist` | `true` | 状态落盘（支持跨重启恢复） |
 | `complete_credential` | `true` | 强制显式完成凭证 |
@@ -115,13 +116,13 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 - 多实例各只写自己的会话条目，读盘合并，**互不覆盖、条目不丢**。
 - 写锁带陈旧检测与超时降级：进程崩溃残留的锁会超时被清，不会造成死锁。
 
-### B) 按"工作目录(worktree)"的运行时互斥（防同时改文件）
-同一工作目录同一时刻**只允许一个活跃自动循环在推进**：
+### B) 按"工作目录(worktree)"的运行时互斥（默认 serial，防同时改文件）
+同一工作目录同一时刻**只允许一个活跃自动循环在推进**（`worktree_policy=serial`，默认）：
 - **同实例多会话**：进程内"在飞令牌"串行化——同 worktree 的不同会话轮流推进（不会同时编辑同一项目）。
 - **跨 opencode 实例**：每 worktree 一把**排他锁文件 + 心跳刷新 + 陈旧抢占**。被他人持有的实例自动等待；持有者暂停/完成/退出后自动让出，等待者接管。
 - 不同 worktree 完全互不影响，可并行。
 
-> 说明：这是"防冲突"的保守策略——同一 worktree 的自动跑会被串行化。若你希望同项目不同子任务真并行地改不同文件，模型各自小心即可（本项目内令牌只挡"同时改同一项目"的明显冲突）。
+> 可切换 `worktree_policy=parallel`（内联、启动弹选或 `goal_configure`）：**不做互斥、同项目可并行推进**，适合想同时改不同文件的激进场景，但需自行注意别互相覆盖。默认 `serial` 保证防冲突。二者为运行时策略，随任务状态落盘。
 
 ## 防卡死设计（学习自旧插件的 bug）
 

@@ -29,6 +29,7 @@ import * as crypto from "node:crypto";
 
 type Mode = "goal" | "iterate" | "off";
 type Recovery = "auto-research" | "pause" | "continue";
+type WorktreePolicy = "serial" | "parallel";
 
 const HEARTBEAT_MS = 5000;
 const LOCK_STALE_MS = 15000;
@@ -44,6 +45,7 @@ interface Options {
   idle_interval_ms: number;
   recovery: Recovery;
   recovery_attempts: number;
+  worktree_policy: WorktreePolicy;
   persist: boolean;
   state_file: string;
   complete_credential: boolean;
@@ -61,6 +63,7 @@ interface RunOverrides {
   idle_interval_ms?: number;
   recovery?: Recovery;
   recovery_attempts?: number;
+  worktree_policy?: WorktreePolicy;
 }
 
 interface EffectiveRunConfig {
@@ -73,6 +76,7 @@ interface EffectiveRunConfig {
   idle_interval_ms: number;
   recovery: Recovery;
   recovery_attempts: number;
+  worktree_policy: WorktreePolicy;
 }
 
 type TurnEnd = "ok" | "no-progress" | "timeout";
@@ -90,6 +94,7 @@ function defaultOptions(raw: Record<string, unknown> | undefined): Options {
     idle_interval_ms: num(raw?.idle_interval_ms, 2000),
     recovery: (raw?.recovery as Recovery) ?? "auto-research",
     recovery_attempts: num(raw?.recovery_attempts, 4),
+    worktree_policy: (raw?.worktree_policy as WorktreePolicy) ?? "serial",
     persist: raw?.persist !== false,
     state_file: mkPath(raw?.state_file, path.join(home, ".config", "opencode", "goal-run-state.json")),
     complete_credential: raw?.complete_credential !== false,
@@ -329,7 +334,11 @@ export class Arbiter {
     }
   }
 
-  canRun(rt: RuntimeLike): boolean {
+  /** May this runtime advance its auto-loop right now?
+   *  policy="parallel" -> no coordination (each run advances freely).
+   *  policy="serial"   -> at most one advances per worktree (existing mutex). */
+  canRun(rt: RuntimeLike, policy: WorktreePolicy): boolean {
+    if (policy === "parallel") return true;
     const w = rt.state.worktree;
     const cur = this.memOwner.get(w);
     if (cur && cur !== rt.state.sessionID) return false;
@@ -528,6 +537,7 @@ export default (async function plugin(input, rawOptions) {
       idle_interval_ms: o.idle_interval_ms ?? options.idle_interval_ms,
       recovery: o.recovery ?? options.recovery,
       recovery_attempts: o.recovery_attempts ?? options.recovery_attempts,
+      worktree_policy: o.worktree_policy ?? options.worktree_policy,
     };
   }
 
@@ -539,7 +549,7 @@ export default (async function plugin(input, rawOptions) {
         (s.completed ? ` (COMPLETE: ${s.completedReason ?? "n/a"})` : "") +
         (s.paused ? ` (PAUSED: ${s.pausedReason})` : "") +
         `.`,
-      `[goal-run] Config: agent<=${eff.max_parallel_agents}/message; turn silence-timeout ${eff.turn_timeout_s}s; max_auto_turns=${eff.max_auto_turns}; recovery=${eff.recovery}(${eff.recovery_attempts}). ` +
+      `[goal-run] Config: agent<=${eff.max_parallel_agents}/message; turn silence-timeout ${eff.turn_timeout_s}s; max_auto_turns=${eff.max_auto_turns}; recovery=${eff.recovery}(${eff.recovery_attempts}); worktree=${eff.worktree_policy}. ` +
         `Rule: only end by calling goal_mark_done with verifiable evidence, OR pause via goal_pause. When stuck, analyze why, use goal_research + web tools to learn, change strategy and keep going. ` +
         (s.mode === "iterate"
           ? `(iterate) Each round: implement→self-test→find gaps→goal_progress(note=...)→engine auto-continues.`
@@ -684,13 +694,14 @@ export default (async function plugin(input, rawOptions) {
     if (rt.running) return;
     if (rt.state.completed || rt.state.paused) return; // no stray turn after stop
 
-    // Concurrency gate: only one active auto-loop advances on a worktree.
-    if (!arbiter.canRun(rt)) {
+    const eff = effConfig(rt);
+
+    // Concurrency gate: serial policy allows only one active auto-loop per worktree.
+    if (!arbiter.canRun(rt, eff.worktree_policy)) {
       scheduleContinue(rt.state.sessionID);
       return;
     }
 
-    const eff = effConfig(rt);
     rt.state.turns += 1;
     rt.turnStart = Date.now();
     rt.lastActivity = Date.now();
@@ -785,6 +796,7 @@ export default (async function plugin(input, rawOptions) {
     if (typeof args.max_turns === "number") o.max_auto_turns = args.max_turns;
     if (typeof args.recovery === "string") o.recovery = args.recovery as Recovery;
     if (typeof args.recovery_attempts === "number") o.recovery_attempts = args.recovery_attempts;
+    if (typeof args.worktree_policy === "string") o.worktree_policy = args.worktree_policy as WorktreePolicy;
     if (typeof args.no_progress_turns === "number") o.no_progress_turns = args.no_progress_turns;
     if (typeof args.converge_turns === "number") o.converge_turns = args.converge_turns;
     if (typeof args.turn_timeout_s === "number") o.turn_timeout_s = args.turn_timeout_s;
@@ -801,6 +813,7 @@ export default (async function plugin(input, rawOptions) {
         max_turns: z.number().int().optional(),
         recovery: recoveryEnum.optional(),
         recovery_attempts: z.number().int().nonnegative().optional(),
+        worktree_policy: z.enum(["serial", "parallel"]).optional().describe("serial=同一工作目录互斥防冲突(默认); parallel=不互斥、可并行推进"),
         no_progress_turns: z.number().int().positive().optional(),
         converge_turns: z.number().int().positive().optional(),
         turn_timeout_s: z.number().positive().optional(),
@@ -816,7 +829,7 @@ export default (async function plugin(input, rawOptions) {
         scheduleContinue(ctx.sessionID);
         return (
           `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}\n` +
-          `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), ` +
+          `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}, ` +
           `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.\n` +
           `Engine runs automatically (shared safely across sessions/instances on this worktree). Use goal_progress/goal_mark_done/goal_configure/goal_pause.`
         );
@@ -830,6 +843,7 @@ export default (async function plugin(input, rawOptions) {
         max_turns: z.number().int().optional(),
         recovery: recoveryEnum.optional(),
         recovery_attempts: z.number().int().nonnegative().optional(),
+        worktree_policy: z.enum(["serial", "parallel"]).optional(),
         no_progress_turns: z.number().int().positive().optional(),
         converge_turns: z.number().int().positive().optional(),
         turn_timeout_s: z.number().positive().optional(),
@@ -842,7 +856,7 @@ export default (async function plugin(input, rawOptions) {
         applyOverrides(rt.state.overrides, args);
         persist(rt);
         const eff = effConfig(rt);
-        return `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.`;
+        return `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}, no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.`;
       },
     },
 

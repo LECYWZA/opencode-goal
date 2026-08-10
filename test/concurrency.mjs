@@ -61,10 +61,19 @@ await (async () => {
   const arb4 = new Arbiter(dir);
   const rta = { state: { worktree: "/serial", sessionID: "sa" } };
   const rtb = { state: { worktree: "/serial", sessionID: "sb" } };
-  check("arb4/rta acquires", arb4.canRun(rta) === true);
-  check("arb4/rtb blocked (local in-flight)", arb4.canRun(rtb) === false);
+  check("arb4/rta acquires", arb4.canRun(rta, "serial") === true);
+  check("arb4/rtb blocked (local in-flight)", arb4.canRun(rtb, "serial") === false);
   arb4.releaseLocal(rta);
-  check("arb4/rtb runs after local release", arb4.canRun(rtb) === true);
+  check("arb4/rtb runs after local release", arb4.canRun(rtb, "serial") === true);
+
+  // parallel policy bypasses coordination entirely
+  const arbP = new Arbiter(dir);
+  const rp1 = { state: { worktree: "/parallel", sessionID: "p1" } };
+  const rp2 = { state: { worktree: "/parallel", sessionID: "p2" } };
+  arbP.canRun(rp1, "serial"); // p1 takes the serial sit
+  check("parallel NOT blocked even while another serial run holds sit", arbP.canRun(rp2, "parallel") === true);
+  const rp3 = { state: { worktree: "/parallel2", sessionID: "p3" } };
+  check("parallel independent session also free", arbP.canRun(rp3, "parallel") === true);
 })();
 
 // cleanup heartbeat intervals so process can exit (Arbiter may hold timers)
