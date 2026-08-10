@@ -102,7 +102,7 @@ function defaultOptions(raw: Record<string, unknown> | undefined): Options {
     recovery_attempts: num(raw?.recovery_attempts, 4),
     worktree_policy: (raw?.worktree_policy as WorktreePolicy) ?? "serial",
     worktree_parallel_sessions: Math.max(1, num(raw?.worktree_parallel_sessions, 1)),
-    thinking_stall_s: Math.max(0, num(raw?.thinking_stall_s, 600)),
+    thinking_stall_s: Math.max(0, num(raw?.thinking_stall_s, 1800)),
     max_repeats: Math.max(2, num(raw?.max_repeats, 5)),
     max_tool_loop: Math.max(2, num(raw?.max_tool_loop, 5)),
     persist: raw?.persist !== false,
