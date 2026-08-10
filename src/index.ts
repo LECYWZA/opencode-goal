@@ -47,6 +47,9 @@ interface Options {
   recovery_attempts: number;
   worktree_policy: WorktreePolicy;
   worktree_parallel_sessions: number;
+  thinking_stall_s: number; // output-only stall (no tool use) -> loop
+  max_repeats: number; // identical delta streaks -> loop
+  max_tool_loop: number; // identical tool+args repeats -> loop
   persist: boolean;
   state_file: string;
   complete_credential: boolean;
@@ -82,7 +85,7 @@ interface EffectiveRunConfig {
   worktree_parallel_sessions: number;
 }
 
-type TurnEnd = "ok" | "no-progress" | "timeout";
+type TurnEnd = "ok" | "no-progress" | "timeout" | "loop";
 
 function defaultOptions(raw: Record<string, unknown> | undefined): Options {
   const home = os.homedir();
@@ -99,6 +102,9 @@ function defaultOptions(raw: Record<string, unknown> | undefined): Options {
     recovery_attempts: num(raw?.recovery_attempts, 4),
     worktree_policy: (raw?.worktree_policy as WorktreePolicy) ?? "serial",
     worktree_parallel_sessions: Math.max(1, num(raw?.worktree_parallel_sessions, 1)),
+    thinking_stall_s: Math.max(0, num(raw?.thinking_stall_s, 120)),
+    max_repeats: Math.max(2, num(raw?.max_repeats, 5)),
+    max_tool_loop: Math.max(2, num(raw?.max_tool_loop, 5)),
     persist: raw?.persist !== false,
     state_file: mkPath(raw?.state_file, path.join(home, ".config", "opencode", "goal-run-state.json")),
     complete_credential: raw?.complete_credential !== false,
@@ -385,6 +391,20 @@ export class Arbiter {
       this.fileOwned.delete(w);
     }
   }
+
+  /** Current holding status of a worktree sit. */
+  held(worktree: string): { ours: boolean; other: boolean } {
+    const p = this.lockPath(worktree);
+    const ours = this.fileOwned.has(worktree);
+    let other = false;
+    try {
+      if (fs.existsSync(p)) {
+        const st = fs.statSync(p);
+        other = !ours && Date.now() - st.mtimeMs < LOCK_STALE_MS;
+      }
+    } catch (e) {}
+    return { ours, other };
+  }
 }
 
 interface RuntimeLike {
@@ -507,7 +527,13 @@ interface Runtime extends RuntimeLike {
   lastActivity: number;
   activity: number;
   progressedThisCycle: boolean;
-  timeoutHit: boolean;
+  loopHit: string | null; // reason a loop/stall/timeout was detected this turn
+  lastToolAt: number;
+  lastOutputAt: number;
+  lastDelta: string;
+  repeatStreak: number;
+  prevToolSig: string;
+  toolLoopCount: number;
   winnerResolver: (() => void) | null;
   lastEnd: TurnEnd;
   recoveryCounter: number;
@@ -537,7 +563,13 @@ export default (async function plugin(input, rawOptions) {
       lastActivity: Date.now(),
       activity: 0,
       progressedThisCycle: false,
-      timeoutHit: false,
+      loopHit: null,
+      lastToolAt: Date.now(),
+      lastOutputAt: Date.now(),
+      lastDelta: "",
+      repeatStreak: 0,
+      prevToolSig: "",
+      toolLoopCount: 0,
       winnerResolver: null,
       lastEnd: "ok",
       recoveryCounter: 0,
@@ -616,6 +648,12 @@ export default (async function plugin(input, rawOptions) {
 
     if (eff.recovery === "pause") return base;
 
+    if (rt.lastEnd === "loop") {
+      return (
+        base +
+        `\n[recovery] 上一轮检测到疑似死循环(思考空转/重复输出/重复工具调用)，已自动中断。本轮请: 直奔能产生确定进展的动作(编辑/运行命令/写文件/查询), 避免空想; 若上一轮在重复做同一件事, 改变做法; 每完成一个可验证小步就立即调用 goal_progress 记录, 让引擎确认进展。`
+      );
+    }
     if (rt.lastEnd === "timeout") {
       return base + `\n[recovery] 上一轮因长时间静默被自动中断(可能命令无限等待或无输出)。本轮请: 先说明你上一轮可能卡在哪(诊断一句), 用 goal_research 或你已有的网络搜索工具排查正确做法, 长命令请自行加超时, 然后推进并调用 goal_progress 记录进展。别固步自封, 主动换思路。`;
     }
@@ -638,7 +676,7 @@ export default (async function plugin(input, rawOptions) {
       return;
     }
 
-    const progressed = rt.progressedThisCycle || rt.activity > 0;
+    const progressed = rt.progressedThisCycle || (rt.activity > 0 && !rt.loopHit);
     if (progressed) {
       s.noProgressTurns = 0;
       s.lastActivityAt = Date.now();
@@ -646,7 +684,7 @@ export default (async function plugin(input, rawOptions) {
       rt.lastEnd = "ok";
     } else {
       s.noProgressTurns += 1;
-      rt.lastEnd = rt.timeoutHit ? "timeout" : "no-progress";
+      rt.lastEnd = rt.loopHit ? "loop" : "no-progress";
     }
 
     if (eff.max_auto_turns >= 0 && s.turns >= eff.max_auto_turns) {
@@ -661,8 +699,8 @@ export default (async function plugin(input, rawOptions) {
         pause(rt, `no meaningful progress for ${s.noProgressTurns} rounds (threshold ${brakeTurns}).`);
         return;
       }
-      if (rt.lastEnd === "timeout") {
-        pause(rt, `a turn was silent for >${eff.turn_timeout_s}s.`);
+      if (rt.lastEnd === "loop") {
+        pause(rt, `a turn stalled (loop:${rt.loopHit}); aborting.`);
         return;
       }
       scheduleContinue(rt.state.sessionID);
@@ -670,7 +708,9 @@ export default (async function plugin(input, rawOptions) {
     }
 
     if (eff.recovery === "auto-research") {
-      const stuck = (rt.lastEnd === "no-progress" && s.noProgressTurns >= brakeTurns) || rt.lastEnd === "timeout";
+      const stuck =
+        (rt.lastEnd === "no-progress" && s.noProgressTurns >= brakeTurns) ||
+        rt.lastEnd === "loop";
       if (stuck) {
         rt.recoveryCounter += 1;
         log("recovery attempt", rt.recoveryCounter, "of", eff.recovery_attempts);
@@ -698,20 +738,37 @@ export default (async function plugin(input, rawOptions) {
     if (options.persist) store.set(rt.state.sessionID, { ...rt.state });
   }
 
+  function triggerLoop(rt: Runtime, kind: string) {
+    if (!rt.running || rt.loopHit) return; // already flagged
+    rt.loopHit = kind;
+    log("loop detected (" + kind + ") on", rt.state.sessionID, "; aborting turn");
+    if (rt.winnerResolver) rt.winnerResolver();
+    try {
+      void client.session.abort({ path: { id: rt.state.sessionID } });
+    } catch (e) {
+      log("abort error", e);
+    }
+  }
+
   function startWatchdog(rt: Runtime, eff: EffectiveRunConfig) {
     stopWatchdog(rt);
     if (eff.turn_timeout_s <= 0) return;
     rt.watchdog = setInterval(() => {
-      if (!rt.running || rt.timeoutHit) return;
-      if (Date.now() - rt.lastActivity > eff.turn_timeout_s * 1000) {
-        rt.timeoutHit = true;
-        log("silence timeout; aborting turn", rt.state.sessionID);
-        if (rt.winnerResolver) rt.winnerResolver();
-        try {
-          void client.session.abort({ path: { id: rt.state.sessionID } });
-        } catch (e) {
-          log("abort error", e);
-        }
+      if (!rt.running || rt.loopHit) return;
+      const now = Date.now();
+      // 1) hard silence timeout (no output AND no tool activity)
+      if (now - rt.lastActivity > eff.turn_timeout_s * 1000) {
+        triggerLoop(rt, "silence");
+        return;
+      }
+      // 2) thinking/replying stall: the model keeps producing tokens but has
+      //    done NO tool work for a long window -> it is spinning in thought.
+      if (
+        options.thinking_stall_s > 0 &&
+        now - rt.lastToolAt > options.thinking_stall_s * 1000 &&
+        now - rt.lastOutputAt < 5000 // it IS still talking right now
+      ) {
+        triggerLoop(rt, "thinking-stall");
       }
     }, 1000);
   }
@@ -753,9 +810,15 @@ export default (async function plugin(input, rawOptions) {
     rt.state.turns += 1;
     rt.turnStart = Date.now();
     rt.lastActivity = Date.now();
+    rt.lastToolAt = Date.now();
+    rt.lastOutputAt = Date.now();
     rt.activity = 0;
     rt.progressedThisCycle = false;
-    rt.timeoutHit = false;
+    rt.loopHit = null;
+    rt.lastDelta = "";
+    rt.repeatStreak = 0;
+    rt.prevToolSig = "";
+    rt.toolLoopCount = 0;
     rt.running = true;
 
     const text = buildTurnText(rt, eff, rt.state.turns);
@@ -805,7 +868,19 @@ export default (async function plugin(input, rawOptions) {
         const delta = event.properties?.delta;
         if (sessionID && typeof delta === "string" && delta.length > 0) {
           const rt = getRuntime(sessionID);
-          if (rt) rt.lastActivity = Date.now();
+          if (rt) {
+            rt.lastActivity = Date.now();
+            rt.lastOutputAt = Date.now();
+            if (rt.running && !rt.loopHit) {
+              if (delta === rt.lastDelta) {
+                rt.repeatStreak += 1;
+                if (rt.repeatStreak >= options.max_repeats) triggerLoop(rt, "repeat-output");
+              } else {
+                rt.repeatStreak = 0;
+              }
+              rt.lastDelta = delta;
+            }
+          }
         }
       }
     } catch (e) {
@@ -1069,6 +1144,46 @@ export default (async function plugin(input, rawOptions) {
       },
     },
 
+    goal_overview: {
+      description: `Return a project-wide overview: all active objective sessions on this worktree, recent concurrent file edits, and whether this worktree's run-sit is held locally or by another process. Use for supervision.`,
+      args: { worktree: z.string().optional().describe("Optional worktree to focus; defaults to current session's worktree.") },
+      execute: async (_args: any, ctx: any) => {
+        const focus = _args.worktree || ctx.worktree;
+        const now = Date.now();
+        const matched = [...runtimes.values()].filter((r) => !focus || r.state.worktree === focus);
+        const active = matched.map((r) => ({
+          sessionID: r.state.sessionID,
+          worktree: r.state.worktree,
+          mode: r.state.mode,
+          objective: r.state.objective.slice(0, 120),
+          completed: r.state.completed,
+          paused: r.state.paused,
+          turns: r.state.turns,
+          lastEnd: r.lastEnd,
+          loopDetected: r.loopHit,
+        }));
+        const recentFiles = [...recentEdits.entries()]
+          .filter(([, t]) => now - t < 120000)
+          .map(([f]) => f)
+          .slice(0, 20);
+        const held = arbiter.held(focus);
+        const eff0 = matched[0] ? effConfig(matched[0]) : null;
+        return JSON.stringify(
+          {
+            activeSessions: active,
+            recentConcurrentEdits_2min: recentFiles,
+            worktreeSit: {
+              policy: eff0 ? `${eff0.worktree_policy}(${eff0.worktree_parallel_sessions})` : "none-active",
+              heldByThisProcess: held.ours,
+              heldByOtherProcess: held.other,
+            },
+          },
+          null,
+          2
+        );
+      },
+    },
+
     goal_abort: {
       description: `Abort and clear the active goal in this session (stops engine, releases sit, removes state).`,
       args: {},
@@ -1112,12 +1227,31 @@ export default (async function plugin(input, rawOptions) {
 
     tool: tools as any,
 
-    "tool.execute.before": async ({ sessionID }: any, output: any) => {
+    "tool.execute.before": async ({ sessionID, tool: t }: any, output: any) => {
       void output;
       const rt = sessionID ? getRuntime(sessionID) : undefined;
       if (rt && rt.running) {
         rt.activity += 1;
         rt.lastActivity = Date.now();
+        rt.lastToolAt = Date.now();
+        rt.lastDelta = "";
+        rt.repeatStreak = 0;
+        // tool-loop detection: identical (tool + args) repeated without change
+        if (!rt.loopHit) {
+          let sig: string;
+          try {
+            sig = `${t}:${JSON.stringify(output?.args ?? {}).slice(0, 200)}`;
+          } catch (e) {
+            sig = String(t);
+          }
+          if (sig === rt.prevToolSig) {
+            rt.toolLoopCount += 1;
+            if (rt.toolLoopCount >= options.max_tool_loop) triggerLoop(rt, "tool-loop");
+          } else {
+            rt.prevToolSig = sig;
+            rt.toolLoopCount = 1;
+          }
+        }
       }
     },
 
