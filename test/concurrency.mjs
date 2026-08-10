@@ -1,4 +1,4 @@
-import { Store, Arbiter } from "../dist/index.js";
+import { Store, Arbiter } from "../dist/cc.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

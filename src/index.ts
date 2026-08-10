@@ -145,7 +145,7 @@ interface GoalState {
 
 type Persisted = Record<string, GoalState>;
 
-export function readBase(file: string): Persisted {
+function readBase(file: string): Persisted {
   try {
     if (fs.existsSync(file)) {
       const p = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -159,7 +159,7 @@ export function readBase(file: string): Persisted {
 
 /** Run fn under an exclusive lock file. Waits (with stale-lock recovery);
  *  degrades to lock-free after LOCK_TIMEOUT so a hung lock never deadlocks. */
-export async function withFileLock(lockPath: string, fn: () => Promise<void> | void): Promise<void> {
+async function withFileLock(lockPath: string, fn: () => Promise<void> | void): Promise<void> {
   const until = Date.now() + LOCK_TIMEOUT_MS;
   let held = false;
   while (!held) {
@@ -201,7 +201,7 @@ export async function withFileLock(lockPath: string, fn: () => Promise<void> | v
  *  Store — merge-write, never blind overwrite (multi-instance safe)
  * ------------------------------------------------------------------ */
 
-export class Store {
+class Store {
   private file: string;
   private tmpFile: string;
   private lockFile: string;
@@ -277,7 +277,7 @@ export class Store {
  *  Arbiter — per-worktree runtime mutex (same process + cross process)
  * ------------------------------------------------------------------ */
 
-export class Arbiter {
+class Arbiter {
   private dir: string;
   private instanceId: string;
   private memCount = new Map<string, number>(); // worktree -> in-flight sessions (this proc)

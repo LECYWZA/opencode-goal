@@ -10,6 +10,7 @@
   ],
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode-ai/plugin --external:@opencode-ai/sdk --outfile=dist/index.js",
+    "build:test": "esbuild src/cc.ts --bundle --platform=node --format=esm --outfile=dist/cc.js",
     "typecheck": "tsc --noEmit",
     "watch": "esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode-ai/plugin --external:@opencode-ai/sdk --outfile=dist/index.js --watch"
   },
