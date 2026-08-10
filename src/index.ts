@@ -120,6 +120,8 @@ function num(v: unknown, d: number): number {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+export const sanitizeFilePart = (id: string) => id.replace(/[^A-Za-z0-9._-]/g, "_");
+
 /* ------------------------------------------------------------------ *
  *  State / Persisted types
  * ------------------------------------------------------------------ */
@@ -780,7 +782,48 @@ export default (async function plugin(input, rawOptions) {
     }
   }
 
+  /** External stop signal from goal-cli (separate process). A flag file in the
+   *  state dir tells us to tear the engine down exactly like goal_abort:
+   *  cancel timer/watchdog, release worktree sit, drop the runtime, and
+   *  - content "delete" → also remove persisted state
+   *  - content "pause" / "stop"(abort) → keep the persisted record (paused).
+   */
+  function checkExternalStop(sessionID: string): boolean {
+    if (!options.persist) return false;
+    const flag = path.join(path.dirname(options.state_file), `goal-run-stop-${sanitizeFilePart(sessionID)}.flag`);
+    try {
+      if (!fs.existsSync(flag) || !fs.statSync(flag).isFile()) return false;
+      const content = fs.readFileSync(flag, "utf8").trim();
+      const rt = getRuntime(sessionID);
+      if (!rt) {
+        try {
+          fs.unlinkSync(flag);
+        } catch (e) {}
+        return false;
+      }
+      if (rt.timer) clearTimeout(rt.timer);
+      rt.timer = null;
+      rt.continuePending = false;
+      stopWatchdog(rt);
+      arbiter.releaseAll(rt);
+      runtimes.delete(sessionID);
+      if (content === "delete") {
+        store.remove(sessionID);
+        void store.flush().catch(() => {});
+      }
+      try {
+        fs.unlinkSync(flag);
+      } catch (e) {}
+      log("external stop applied for", sessionID, "mode=", content || "stop");
+      return true;
+    } catch (e) {
+      log("external stop check error", e);
+      return false;
+    }
+  }
+
   function scheduleContinue(sessionID: string) {
+    if (checkExternalStop(sessionID)) return;
     const rt = getRuntime(sessionID);
     if (!rt) return;
     const s = rt.state;
@@ -796,6 +839,7 @@ export default (async function plugin(input, rawOptions) {
   }
 
   async function doContinue(rt: Runtime) {
+    if (checkExternalStop(rt.state.sessionID)) return;
     if (rt.running) return;
     if (rt.state.completed || rt.state.paused) return; // no stray turn after stop
 
