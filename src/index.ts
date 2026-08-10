@@ -565,7 +565,7 @@ export default (async function plugin(input, rawOptions) {
   function rulesBlock(rt: Runtime): string[] {
     const s = rt.state;
     const eff = effConfig(rt);
-    return [
+    const lines: string[] = [
       `[goal-run] Active objective engine (mode=${s.mode}). Objective: ${s.objective}` +
         (s.completed ? ` (COMPLETE: ${s.completedReason ?? "n/a"})` : "") +
         (s.paused ? ` (PAUSED: ${s.pausedReason})` : "") +
@@ -578,14 +578,30 @@ export default (async function plugin(input, rawOptions) {
       `[goal-run] Verification principle (MANDATORY): be SKEPTICAL of search results/docs/claims — they are LEADS, not facts. Verify critical conclusions yourself (run command, build/test, open source). Mark unverifiable assumptions as "unverified (speculative)".`,
       `[goal-run] Concurrency: this worktree's auto-loop may be shared across sessions/instances. If another run appears to hold it, wait — do not duplicate edits. This session advances in rounds; if paused, just continue when resumed.`,
     ];
+    const risk = eff.worktree_policy === "parallel" || eff.worktree_parallel_sessions > 1;
+    if (risk) {
+      lines.push(
+        `[goal-run] PARALLEL-WORK GUIDELINES (active: worktree=${eff.worktree_policy}, parallel_sessions=${eff.worktree_parallel_sessions}): ` +
+          `multiple sessions/instances may be editing this project at once. To avoid clobbering each other: ` +
+          `(1) before editing/changing an existing file, READ its latest content first and edit based on that; ` +
+          `(2) prefer dividing work so concurrent runs touch different files or non-overlapping regions; ` +
+          `(3) after making changes, run git status/diff to check you haven't overwritten someone else's edits; ` +
+          `(4) if a file changed underneath you, re-read and re-apply your intended change rather than force-overwriting.`
+      );
+    }
+    return lines;
   }
 
   function buildTurnText(rt: Runtime, eff: EffectiveRunConfig, runs: number): string {
     const s = rt.state;
-    const base =
+    let base =
       s.mode === "iterate"
         ? `[goal-run] Round ${runs}. Continue improving: ${s.objective}. Implement → self-test → find gaps → call goal_progress(note=...) to log this round's increment. Finish only via goal_mark_done.`
         : `[goal-run] Round ${runs}. Continue working toward: ${s.objective}. Do real work with tools. Call goal_progress when you make progress. Finish via goal_mark_done (do not stop without it).`;
+
+    if (eff.worktree_policy === "parallel" || eff.worktree_parallel_sessions > 1) {
+      base += `\n[parallel] 同项目可能被其它会话/实例并行编辑——改现有文件前先读取最新内容，分工避重，改后 git status/diff 检查是否覆盖他人改动。`;
+    }
 
     if (eff.recovery === "pause") return base;
 
