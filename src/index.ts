@@ -18,6 +18,9 @@ import * as os from "node:os";
  *     with evidence) — never silently stop.
  *   - NO blocking work inside event callbacks (schedule via setTimeout),
  *     to avoid freezing on Windows.
+ *   - PER-RUN CONFIG: global options are DEFAULTS only; each goal can
+ *     carry overrides set at launch time (goal_set / goal_configure) so
+ *     the user never has to edit config to change agents/limits.
  * ------------------------------------------------------------------ */
 
 type Mode = "goal" | "iterate" | "off";
@@ -36,6 +39,25 @@ interface Options {
   human_gate: boolean;
   command_keyword: string;
   debug: boolean;
+}
+
+interface RunOverrides {
+  max_parallel_agents?: number;
+  max_auto_turns?: number;
+  no_progress_turns?: number;
+  converge_turns?: number;
+  turn_timeout_s?: number;
+  idle_interval_ms?: number;
+}
+
+interface EffectiveRunConfig {
+  mode: Exclude<Mode, "off">;
+  max_parallel_agents: number;
+  max_auto_turns: number;
+  no_progress_turns: number;
+  converge_turns: number;
+  turn_timeout_s: number;
+  idle_interval_ms: number;
 }
 
 function defaultOptions(raw: Record<string, unknown> | undefined): Options {
@@ -83,6 +105,7 @@ interface GoalState {
   noProgressTurns: number;
   progressLog: string[];
   lastNote?: string;
+  overrides?: RunOverrides;
 }
 
 interface Runtime {
@@ -96,8 +119,6 @@ interface Runtime {
 }
 
 type Persisted = Record<string, GoalState>;
-
-const persistedFileLock: Promise<void> = Promise.resolve();
 
 /* ------------------------------------------------------------------ *
  *  Store (persistence)
@@ -196,10 +217,25 @@ export default (async function plugin(input, rawOptions) {
     return rt;
   }
 
+  /* merge per-run overrides over global defaults */
+  function effConfig(rt: Runtime): EffectiveRunConfig {
+    const o = rt.state.overrides ?? {};
+    return {
+      mode: rt.state.mode,
+      max_parallel_agents: o.max_parallel_agents ?? options.max_parallel_agents,
+      max_auto_turns: o.max_auto_turns ?? options.max_auto_turns,
+      no_progress_turns: o.no_progress_turns ?? options.no_progress_turns,
+      converge_turns: o.converge_turns ?? options.converge_turns,
+      turn_timeout_s: o.turn_timeout_s ?? options.turn_timeout_s,
+      idle_interval_ms: o.idle_interval_ms ?? options.idle_interval_ms,
+    };
+  }
+
   /* ---------- system prompt injection ---------- */
   function rulesBlock(rt: Runtime): string[] {
     const s = rt.state;
-    const maxAgents = options.max_parallel_agents;
+    const eff = effConfig(rt);
+    const maxAgents = eff.max_parallel_agents;
     const block: string[] = [];
     block.push(
       `[goal-run] Active objective engine (mode=${s.mode}). Current objective: ${s.objective}` +
@@ -226,7 +262,7 @@ export default (async function plugin(input, rawOptions) {
     }
     block.push(
       `[goal-run] Completion rule: you may only stop the loop by calling goal_mark_done with concrete, verifiable evidence. ` +
-        `To pause/temporarily stop use goal_pause. To query state use goal_status. To extend an already-completed objective, call goal_continue(extra=...).`
+        `To pause/temporarily stop use goal_pause. To change per-run parameters at any time use goal_configure. To query state use goal_status. To extend an already-completed objective, call goal_continue(extra=...).`
     );
     return block;
   }
@@ -236,15 +272,16 @@ export default (async function plugin(input, rawOptions) {
     const s = rt.state;
     if (s.completed) return undefined; // handled elsewhere
     if (s.paused) return undefined;
-    const brakeTurns = s.mode === "iterate" ? options.converge_turns : options.no_progress_turns;
-    if (rt.state.noProgressTurns >= brakeTurns) {
-      return `no meaningful progress for ${rt.state.noProgressTurns} consecutive rounds (threshold ${brakeTurns}).`;
+    const eff = effConfig(rt);
+    const brakeTurns = eff.mode === "iterate" ? eff.converge_turns : eff.no_progress_turns;
+    if (s.noProgressTurns >= brakeTurns) {
+      return `no meaningful progress for ${s.noProgressTurns} consecutive rounds (threshold ${brakeTurns}).`;
     }
-    if (options.max_auto_turns >= 0 && s.turns >= options.max_auto_turns) {
-      return `reached configured max_auto_turns (${options.max_auto_turns}).`;
+    if (eff.max_auto_turns >= 0 && s.turns >= eff.max_auto_turns) {
+      return `reached configured max_auto_turns (${eff.max_auto_turns}).`;
     }
-    if (rt.running && options.turn_timeout_s > 0 && Date.now() - rt.turnStart > options.turn_timeout_s * 1000) {
-      return `turn exceeded ${options.turn_timeout_s}s timeout.`;
+    if (rt.running && eff.turn_timeout_s > 0 && Date.now() - rt.turnStart > eff.turn_timeout_s * 1000) {
+      return `turn exceeded ${eff.turn_timeout_s}s timeout.`;
     }
     return undefined;
   }
@@ -270,12 +307,13 @@ export default (async function plugin(input, rawOptions) {
     const s = rt.state;
     if (s.completed || s.paused) return;
     if (rt.running || rt.continuePending) return; // single-flight + no storm
+    const eff = effConfig(rt);
     rt.continuePending = true;
     rt.timer = setTimeout(() => {
       rt.timer = null;
       rt.continuePending = false;
       void doContinue(rt);
-    }, options.idle_interval_ms);
+    }, eff.idle_interval_ms);
   }
 
   function continueText(rt: Runtime): string {
@@ -306,13 +344,11 @@ export default (async function plugin(input, rawOptions) {
         path: { id: rt.state.sessionID },
         body: { parts: [{ type: "text", text: continueText(rt) }] },
       });
-      // success path: 200
       void result;
     } catch (e) {
       log("prompt error", e);
     } finally {
       rt.running = false;
-      // progress bookkeeping
       if (rt.progressedThisCycle || rt.activity > 0) {
         rt.state.noProgressTurns = 0;
         rt.state.lastActivityAt = Date.now();
@@ -328,7 +364,6 @@ export default (async function plugin(input, rawOptions) {
       } else if (rt.state.completed || rt.state.paused) {
         // stop
       } else {
-        // self-chain to next round (single-flight guards double from idle events)
         scheduleContinue(rt.state.sessionID);
       }
     }
@@ -342,15 +377,7 @@ export default (async function plugin(input, rawOptions) {
         const sessionID = event.properties?.sessionID as string;
         const rt = getRuntime(sessionID);
         if (!rt) return;
-        // A real user or programmatic turn finished and the session is idle again.
-        // If the loop is already running (our own continue), don't double trigger.
         scheduleContinue(sessionID);
-      } else if (event.type === "tool.execute.before") {
-        const sessionID = (event as any).properties?.sessionID;
-        const rt = sessionID ? getRuntime(sessionID) : undefined;
-        if (rt && rt.running) {
-          rt.activity += 1;
-        }
       }
     } catch (e) {
       log("event error", e);
@@ -358,10 +385,13 @@ export default (async function plugin(input, rawOptions) {
   }
 
   /* ---------- tools ---------- */
-  const taskLimitNote = () =>
-    `Concurrent subagent (task) limit: ${options.max_parallel_agents} per message.`;
-
-  function ensureRt(sessionID: string, worktree: string, directory: string, mode: Exclude<Mode, "off">, objective: string): Runtime {
+  function ensureRt(
+    sessionID: string,
+    worktree: string,
+    directory: string,
+    mode: Exclude<Mode, "off">,
+    objective: string
+  ): Runtime {
     let rt = getRuntime(sessionID);
     if (rt) {
       rt.state.mode = mode;
@@ -396,15 +426,66 @@ export default (async function plugin(input, rawOptions) {
 
   const tools = {
     goal_set: {
-      description: `Start or overwrite an autonomous objective. Use when the user wants the AI to keep working by itself until done. Requires goal and mode. ${taskLimitNote()}`,
+      description: `Start or overwrite an autonomous objective. Use when the user wants the AI to keep working by itself until done. Requires goal. Optionally set per-run parameters here (they override global defaults for THIS task only). Available per-run params: agent (concurrent subagents), max_turns (-1=infinite), no_progress_turns, converge_turns, turn_timeout_s, idle_interval_ms.`,
       args: {
         goal: z.string().describe("The concrete objective to pursue autonomously."),
-        mode: z.enum(["goal", "iterate"]).optional().describe('"goal" = run until complete; "iterate" = keep improving forever until convergence.'),
+        mode: z.enum(["goal", "iterate"]).optional().describe('"goal" = run until complete; "iterate" = keep improving until convergence.'),
+        agent: z.number().int().positive().optional().describe("Max concurrent subagent(task) calls for this task."),
+        max_turns: z.number().int().optional().describe("Auto-run turn cap, -1 = unlimited."),
+        no_progress_turns: z.number().int().positive().optional().describe("Goal mode: pause after this many consecutive no-progress rounds."),
+        converge_turns: z.number().int().positive().optional().describe("Iterate mode: pause after this many consecutive no-improvement rounds."),
+        turn_timeout_s: z.number().positive().optional().describe("Per-turn timeout in seconds."),
+        idle_interval_ms: z.number().positive().optional().describe("Minimum interval between auto-continues (ms)."),
       },
       execute: async (args: any, ctx: any) => {
         const mode: Exclude<Mode, "off"> = args.mode === "iterate" ? "iterate" : "goal";
         const rt = ensureRt(ctx.sessionID, ctx.worktree, ctx.directory, mode, args.goal);
-        return `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}. Parallel agent limit: ${options.max_parallel_agents}. The engine will keep running automatically. Log progress with goal_progress; finish with goal_mark_done.`;
+        if (!rt.state.overrides) rt.state.overrides = {};
+        if (args.agent !== undefined) rt.state.overrides.max_parallel_agents = args.agent;
+        if (args.max_turns !== undefined) rt.state.overrides.max_auto_turns = args.max_turns;
+        if (args.no_progress_turns !== undefined) rt.state.overrides.no_progress_turns = args.no_progress_turns;
+        if (args.converge_turns !== undefined) rt.state.overrides.converge_turns = args.converge_turns;
+        if (args.turn_timeout_s !== undefined) rt.state.overrides.turn_timeout_s = args.turn_timeout_s;
+        if (args.idle_interval_ms !== undefined) rt.state.overrides.idle_interval_ms = args.idle_interval_ms;
+        persist(rt);
+        const eff = effConfig(rt);
+        return (
+          `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}.\n` +
+          `Per-run config (effective): agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, ` +
+          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, ` +
+          `turn_timeout_s=${eff.turn_timeout_s}, idle_interval_ms=${eff.idle_interval_ms}.\n` +
+          `The engine will keep running automatically. Log progress with goal_progress; finish with goal_mark_done; change params anytime with goal_configure.`
+        );
+      },
+    },
+
+    goal_configure: {
+      description: `Change per-run parameters of the active objective at any time (does NOT reset progress). Supported: agent, max_turns, no_progress_turns, converge_turns, turn_timeout_s, idle_interval_ms.`,
+      args: {
+        agent: z.number().int().positive().optional(),
+        max_turns: z.number().int().optional(),
+        no_progress_turns: z.number().int().positive().optional(),
+        converge_turns: z.number().int().positive().optional(),
+        turn_timeout_s: z.number().positive().optional(),
+        idle_interval_ms: z.number().positive().optional(),
+      },
+      execute: async (args: any, ctx: any) => {
+        const rt = getRuntime(ctx.sessionID);
+        if (!rt) return "No active objective; call goal_set first.";
+        if (!rt.state.overrides) rt.state.overrides = {};
+        if (args.agent !== undefined) rt.state.overrides.max_parallel_agents = args.agent;
+        if (args.max_turns !== undefined) rt.state.overrides.max_auto_turns = args.max_turns;
+        if (args.no_progress_turns !== undefined) rt.state.overrides.no_progress_turns = args.no_progress_turns;
+        if (args.converge_turns !== undefined) rt.state.overrides.converge_turns = args.converge_turns;
+        if (args.turn_timeout_s !== undefined) rt.state.overrides.turn_timeout_s = args.turn_timeout_s;
+        if (args.idle_interval_ms !== undefined) rt.state.overrides.idle_interval_ms = args.idle_interval_ms;
+        persist(rt);
+        const eff = effConfig(rt);
+        return (
+          `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, ` +
+          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, ` +
+          `turn_timeout_s=${eff.turn_timeout_s}, idle_interval_ms=${eff.idle_interval_ms}.`
+        );
       },
     },
 
@@ -509,12 +590,13 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_status: {
-      description: `Return the current goal-run engine status for this session.`,
+      description: `Return the current goal-run engine status (including effective config) for this session.`,
       args: {},
       execute: async (_args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective in this session.";
         const s = rt.state;
+        const eff = effConfig(rt);
         const brake = brakeReason(rt);
         return JSON.stringify(
           {
@@ -528,7 +610,7 @@ export default (async function plugin(input, rawOptions) {
             noProgressTurns: s.noProgressTurns,
             brakeActive: !!brake,
             progressLog: s.progressLog,
-            parallelAgentLimit: options.max_parallel_agents,
+            effectiveConfig: eff,
           },
           null,
           2
@@ -564,6 +646,7 @@ export default (async function plugin(input, rawOptions) {
             progressLog: s.progressLog.slice(-5),
             paused: s.paused,
             pausedReason: s.pausedReason,
+            effectiveConfig: s.overrides,
           }));
         if (recs.length === 0) return "No incomplete persisted objectives.";
         return JSON.stringify(recs, null, 2);
@@ -577,7 +660,7 @@ export default (async function plugin(input, rawOptions) {
 
     tool: tools as any,
 
-    "tool.execute.before": async ({ sessionID }: any, output: any) => {
+    "tool.execute.before": async ({ sessionID, tool: t }: any, output: any) => {
       void output;
       const rt = sessionID ? getRuntime(sessionID) : undefined;
       if (rt && rt.running) rt.activity += 1;

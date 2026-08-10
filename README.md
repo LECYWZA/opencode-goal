@@ -29,15 +29,28 @@ npm run build      # 改源码后必须重新构建
 
 | 命令 | 作用 |
 |---|---|
-| `/goal 目标…` | 以目标模式启动，自动续跑到完成 |
-| `/iterate 目标…` | 以迭代(自我优化)模式启动 |
-| `/goal-restore` | 检查持久化的未完成任务，询问是否继续（跨重启恢复） |
+| `/my_goal 目标…` | 以目标模式启动，开始前弹选并行度/轮次等参数，自动续跑到完成 |
+| `/my_iterate 目标…` | 以迭代(自我优化)模式启动，自动反复改进到收敛 |
+| `/my_goal_restore` | 检查持久化的未完成任务，询问是否继续（跨重启恢复） |
 
-## 参数配置（opencode.jsonc → plugin options）
+> 全部命令统一 `/my_` 前缀。也可不用命令，直接让模型调用 `goal_set` 工具。
+
+## 运行时配置（不用改 config）
+
+config 里的参数只是**全局默认值**。每个任务实际生效的参数可以在运行时单独设置，优先级：**本次任务的覆盖 > 全局默认**。三种方式：
+
+1. **内联参数**（目标里直接带，如）：`/my_goal 做一个XX agent=3 max_turns=50`
+   - 支持：`agent`(并行数) `max_turns`(-1=无限) `no_progress_turns` `converge_turns` `turn_timeout_s` `idle_interval_ms`
+2. **启动时弹选**：未在命令行指定时，命令会用 question 工具**弹出选择**让你确认（并行 agent 数、是否限制轮次），无需接触配置文件。
+3. **运行中调整**：随时让模型调用 `goal_configure(agent=…, max_turns=…, …)` 即可改动当前任务参数，不重置进度。
+
+任务级配置随状态一起落盘，跨重启恢复时保持。
+
+## 参数（config 仅作全局默认）
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `goal` | `goal` / `iterate` / `off`（全局默认，也可由命令指定） |
+| `mode` | `goal` | `goal` / `iterate` / `off`（全局默认，命令会按需覆盖） |
 | `max_parallel_agents` | `1` | 同一时刻最多并行的 subagent(task) 数量 |
 | `max_auto_turns` | `-1` | 自动续跑轮次上限，`-1` = 无限 |
 | `turn_timeout_s` | `300` | 单轮超时兜底（秒） |
@@ -53,7 +66,7 @@ npm run build      # 改源码后必须重新构建
 
 ## 如何停下来
 
-1. **手动**：输入 `停止` / `暂停` / `goal_pause`，立即暂停（状态保留，可 `/goal-restore` 或 `goal_resume` 恢复）。
+1. **手动**：输入 `停止` / `暂停` / `goal_pause`，立即暂停（状态保留，可 `/my_goal_restore` 或 `goal_resume` 恢复）。
 2. **目标完成**：模型调用 `goal_mark_done`（须附证据）→ 自动停；`human_gate` 开启时再等你确认是否深挖。
 3. **收敛**（迭代模式）：连续 `converge_turns` 轮无改进 → 自动暂停。
 4. **兜底刹车**：`no_progress_turns` 无进展、`turn_timeout_s` 单轮超时、`max_auto_turns` 轮次上限——全部走「暂停」而非「终止」，随时可续。
@@ -61,11 +74,12 @@ npm run build      # 改源码后必须重新构建
 ## 执行流程（目标模式示例）
 
 ```
-用户: /goal 完成XX
-  → 模型调 goal_set(goal, mode=goal)
-  → 插件注入规则到系统提示 + 落盘状态
+用户: /my_goal 完成XX
+  → 模型先用 question 弹选确认并行度/轮次等参数
+  → 模型调 goal_set(goal, mode=goal, agent=…, max_turns=…)
+  → 插件注入规则到系统提示 + 落盘状态(含本次参数)
   → 引擎自动续跑(单飞锁+去抖): client.prompt("第N轮继续…")
-  → 每轮: 模型做实际工作 / 调 goal_progress 记录进展 / 可调多个 task(≤并行上限)
+  → 每轮: 模型做实际工作 / 调 goal_progress 记录进展 / 可调多个 task(≤该任务并行上限)
   → 模型调 goal_mark_done(evidence, verification)
   → 插件置完成、停止自动循环、等你确认
   → 你回“继续”→ 模型调 goal_continue(新目标) → 恢复深挖

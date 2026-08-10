@@ -75,5 +75,17 @@ await tools.goal_pause.execute({ reason: "blocked on infra" }, ctx2);
 const st3 = JSON.parse(await tools.goal_status.execute({}, ctx2));
 console.log("s2 paused:", st3.paused, st3.pausedReason);
 
+// 7. per-run overrides + goal_configure
+console.log("--- overrides: goal_set with agent=3 max_turns=-1 ---");
+const ctx3 = { sessionID: "s3", worktree: "/w3", directory: "/d3", agent: "build", messageID: "m3" };
+await tools.goal_set.execute({ goal: "overridable", mode: "goal", agent: 3, max_turns: -1 }, ctx3);
+let st4 = JSON.parse(await tools.goal_status.execute({}, ctx3));
+console.log("effective agent:", st4.effectiveConfig.max_parallel_agents, "| max_turns:", st4.effectiveConfig.max_auto_turns);
+
+console.log("--- goal_configure(agent=5, converge_turns=2) ---");
+await tools.goal_configure.execute({ agent: 5, converge_turns: 2 }, ctx3);
+st4 = JSON.parse(await tools.goal_status.execute({}, ctx3));
+console.log("after configure agent:", st4.effectiveConfig.max_parallel_agents, "| converge:", st4.effectiveConfig.converge_turns);
+
 console.log("\nSMOKE OK");
 process.exit(0);
