@@ -233,59 +233,94 @@ function stripHtml(html: string): string {
     .trim();
 }
 
-async function research(query: string): Promise<string> {
+/* Multi-engine research: Bing, Google, DuckDuckGo, GitHub, HuggingFace,
+ * Stack Overflow. Returns {text, reachable} where reachable is the number
+ * of engines that returned usable results — 0 means nothing reachable. */
+interface ResearchResult {
+  text: string;
+  reachable: number;
+}
+
+async function research(query: string): Promise<ResearchResult> {
   const q = encodeURIComponent(query);
   const out: string[] = [`Research: ${query}`];
+  const reachable = { n: 0 };
 
-  // 1) GitHub repositories
-  try {
-    const txt = await fetchText(`https://api.github.com/search/repositories?q=${q}&per_page=5`);
-    if (txt) {
-      const j = JSON.parse(txt);
-      const items = (j?.items ?? []).slice(0, 5);
-      out.push("## GitHub");
-      for (const it of items) {
-        out.push(`- ${it.full_name} — ${(it.description ?? "").slice(0, 180)} (★${it.stargazers_count})`);
+  async function run(name: string, fn: () => Promise<string[]>): Promise<void> {
+    try {
+      const rows = await fn();
+      if (rows.length) {
+        reachable.n += 1;
+        out.push(`## ${name}`);
+        out.push(...rows.slice(0, 5));
       }
+    } catch (e) {
+      /* engine failed, ignore */
     }
-  } catch (e) {
-    out.push("## GitHub (error)");
   }
 
-  // 2) HuggingFace models
-  try {
-    const txt = await fetchText(`https://huggingface.co/api/models?search=${q}&limit=5`);
-    if (txt) {
-      const j = JSON.parse(txt);
-      const items = (j ?? []).slice(0, 5);
-      out.push("## HuggingFace");
-      for (const it of items) {
-        out.push(`- ${it.id} — ${(it.pipeline_tag ?? "")} downloads:${it.downloads ?? "-"}`);
-      }
-    }
-  } catch (e) {
-    out.push("## HuggingFace (error)");
-  }
-
-  // 3) Bing web search (HTML scrape)
-  const bing = await fetchText(`https://www.bing.com/search?q=${q}`);
-  if (bing && bing.length > 0) {
+  // 1) Bing web search (HTML scrape)
+  await run("Bing", async () => {
+    const html = await fetchText(`https://www.bing.com/search?q=${q}`);
     const re = /<li class="b_algo"[\s\S]*?<h2><a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<p[\s\S]*?>([\s\S]*?)<\/p>/gi;
-    const results: string[] = [];
+    const res: string[] = [];
     let m: RegExpExecArray | null;
     let guard = 0;
-    while ((m = re.exec(bing)) && guard++ < 5) {
-      const title = stripHtml(m[2]).slice(0, 120);
-      const desc = stripHtml(m[3]).slice(0, 240);
-      results.push(`- ${title} — ${m[1]} — ${desc}`);
+    while ((m = re.exec(html)) && guard++ < 5) {
+      res.push(`- ${stripHtml(m[2]).slice(0, 120)} — ${m[1]} — ${stripHtml(m[3]).slice(0, 240)}`);
     }
-    out.push("## Bing");
-    out.push(...(results.length ? results : ["(no parseable results)"]));
-  } else {
-    out.push("## Bing (unreachable)");
-  }
+    return res;
+  });
 
-  return out.join("\n").slice(0, 6000);
+  // 2) Google web search (HTML scrape)
+  await run("Google", async () => {
+    const html = await fetchText(`https://www.google.com/search?q=${q}&num=5`);
+    const re = /<h3[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<a href="(\/url\?q=[^"]+)"/gi;
+    const res: string[] = [];
+    let m: RegExpExecArray | null;
+    let guard = 0;
+    while ((m = re.exec(html)) && guard++ < 5) {
+      const target = decodeURIComponent(m[2].replace(/^\/url\?q=/, "").split("&")[0]).replace(/^https?:\/\//, "");
+      res.push(`- ${stripHtml(m[1]).slice(0, 120)} — ${target}`);
+    }
+    return res;
+  });
+
+  // 3) DuckDuckGo (Lite) — reliable, no API key
+  await run("DuckDuckGo", async () => {
+    const html = await fetchText(`https://html.duckduckgo.com/html/?q=${q}`);
+    const re = /<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+    const res: string[] = [];
+    let m: RegExpExecArray | null;
+    let guard = 0;
+    while ((m = re.exec(html)) && guard++ < 5) {
+      res.push(`- ${stripHtml(m[2]).slice(0, 120)} — ${m[1]} — ${stripHtml(m[3]).slice(0, 240)}`);
+    }
+    return res;
+  });
+
+  // 4) Stack Overflow / StackExchange API (no key)
+  await run("StackOverflow", async () => {
+    const j = JSON.parse(await fetchText(`https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q=${query}&site=stackoverflow&pagesize=5`));
+    const items: any[] = Array.isArray(j?.items) ? j.items : [];
+    return items.map((it) => `- ${(it.title ?? "").slice(0, 140)} — ${it.link} (answered:${(it.answer_count ?? 0) > 0})`);
+  });
+
+  // 5) GitHub repositories
+  await run("GitHub", async () => {
+    const j = JSON.parse(await fetchText(`https://api.github.com/search/repositories?q=${q}&per_page=5`));
+    const items: any[] = Array.isArray(j?.items) ? j.items : [];
+    return items.map((it) => `- ${it.full_name} — ${(it.description ?? "").slice(0, 180)} (★${it.stargazers_count})`);
+  });
+
+  // 6) HuggingFace models
+  await run("HuggingFace", async () => {
+    const j = JSON.parse(await fetchText(`https://huggingface.co/api/models?search=${query}&limit=5`));
+    const items: any[] = Array.isArray(j) ? j : [];
+    return items.map((it) => `- ${it.id} — ${(it.pipeline_tag ?? "")} downloads:${it.downloads ?? "-"}`);
+  });
+
+  return { text: out.join("\n").slice(0, 6000), reachable: reachable.n };
 }
 
 /* ------------------------------------------------------------------ *
@@ -358,6 +393,11 @@ export default (async function plugin(input, rawOptions) {
           ? `(iterate) Each round: implement→self-test→find gaps→goal_progress(note=...)→engine auto-continues.`
           : `(goal) Work toward the objective each round; log via goal_progress; finish via goal_mark_done.`)
     );
+    block.push(
+      `[goal-run] Verification principle (MANDATORY): be SKEPTICAL of search results, docs, and second-hand claims — they are LEADS, not facts. ` +
+        `Before adopting any critical conclusion, VERIFY it yourself: run the command, build/test, or open the actual source/docs. ` +
+        `If you cannot verify a key assumption, mark it explicitly as "unverified (speculative)" and do not build heavier work on top of it.`
+    );
     return block;
   }
 
@@ -384,7 +424,7 @@ export default (async function plugin(input, rawOptions) {
     if (rt.lastEnd === "no-progress") {
       return (
         base +
-        `\n[recovery] 上一轮未产生可验证进展。本轮请: (1)冷静分析为何无进展(卡点/缺条件/方法是否错误); (2)用 goal_research(Bing/GitHub/HuggingFace) 或网络搜索查找相关解法; (3)提出并实施修正方案; (4)调用 goal_progress 记录结果或说明仍受阻的根本原因。主动进化, 不要重复同样无效的动作。`
+        `\n[recovery] 上一轮未产生可验证进展。本轮请: (1)冷静分析为何无进展(卡点/缺条件/方法是否错误); (2)用 goal_research(Bing/Google/DuckDuckGo/GitHub/HuggingFace/StackOverflow) 或你自己的网络搜索工具查找相关解法; (3)对搜索结果保持怀疑——基于其给出的新路线，先用最小例子/命令亲自验证方向是否正确，再放大推进，不要盲信搜索摘要; (4)调用 goal_progress 记录结果或说明仍受阻的根本原因。主动进化, 不要重复同样无效的动作。`
       );
     }
     return base;
@@ -729,13 +769,26 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_research: {
-      description: `Self-evolution helper: search Bing (web), GitHub repos, and HuggingFace for material/vibe related to a topic, to unblock when stuck. Use it when you have no idea how to proceed.`,
+      description: `Self-evolution helper: search across Bing, Google, DuckDuckGo, Stack Overflow, GitHub, and HuggingFace to unblock when stuck. Treat results as leads to verify yourself. Use it when you have no idea how to proceed.`,
       args: {
         query: z.string().describe("Search query (topic / error / library / technique)."),
       },
       execute: async (args: any) => {
-        const text = await research(args.query);
-        return text || "No results returned.";
+        const r = await research(args.query);
+        let body = r.text || "No results returned.";
+        if (r.reachable === 0) {
+          body +=
+            `\n[goal-research note] NONE of the built-in engines were reachable right now. ` +
+            `Instead use one of your own available web-search/webfetch tools or MCP servers ` +
+            `(opencode typically exposes search tools such as web-search-sse / webfetch / websearch). ` +
+            `Inspect your tool list and call one to research: "${args.query}".`;
+        } else {
+          body +=
+            `\n[goal-research note] These are LEADS ONLY — be skeptical. Before adopting any critical claim, ` +
+            `VERIFY it yourself: run the command, build/test, or open the linked source/docs. ` +
+            `Mark anything you could not verify as "unverified(speculative)".`;
+        }
+        return body;
       },
     },
 
