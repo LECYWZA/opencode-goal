@@ -46,6 +46,7 @@ interface Options {
   recovery: Recovery;
   recovery_attempts: number;
   worktree_policy: WorktreePolicy;
+  worktree_parallel_sessions: number;
   persist: boolean;
   state_file: string;
   complete_credential: boolean;
@@ -64,6 +65,7 @@ interface RunOverrides {
   recovery?: Recovery;
   recovery_attempts?: number;
   worktree_policy?: WorktreePolicy;
+  worktree_parallel_sessions?: number;
 }
 
 interface EffectiveRunConfig {
@@ -77,6 +79,7 @@ interface EffectiveRunConfig {
   recovery: Recovery;
   recovery_attempts: number;
   worktree_policy: WorktreePolicy;
+  worktree_parallel_sessions: number;
 }
 
 type TurnEnd = "ok" | "no-progress" | "timeout";
@@ -95,6 +98,7 @@ function defaultOptions(raw: Record<string, unknown> | undefined): Options {
     recovery: (raw?.recovery as Recovery) ?? "auto-research",
     recovery_attempts: num(raw?.recovery_attempts, 4),
     worktree_policy: (raw?.worktree_policy as WorktreePolicy) ?? "serial",
+    worktree_parallel_sessions: Math.max(1, num(raw?.worktree_parallel_sessions, 1)),
     persist: raw?.persist !== false,
     state_file: mkPath(raw?.state_file, path.join(home, ".config", "opencode", "goal-run-state.json")),
     complete_credential: raw?.complete_credential !== false,
@@ -270,8 +274,9 @@ export class Store {
 export class Arbiter {
   private dir: string;
   private instanceId: string;
-  private memOwner = new Map<string, string>();
-  private fileOwned = new Set<string>();
+  private memCount = new Map<string, number>(); // worktree -> in-flight sessions (this proc)
+  private counted = new Set<string>(); // `${worktree}:${sessionID}` in-flight
+  private fileOwned = new Set<string>(); // worktrees whose lock file this proc owns
   private heartbeats = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(stateDir: string) {
@@ -337,26 +342,41 @@ export class Arbiter {
   /** May this runtime advance its auto-loop right now?
    *  policy="parallel" -> no coordination (each run advances freely).
    *  policy="serial"   -> at most one advances per worktree (existing mutex). */
-  canRun(rt: RuntimeLike, policy: WorktreePolicy): boolean {
+  /** May this runtime advance its auto-loop right now?
+   *  policy="parallel"        -> no coordination (each run advances freely).
+   *  policy="serial"          -> cross-process mutex via lock file (1 instance),
+   *                              plus same-process slot limit = parallelN
+   *                              (N-way in-flight on the same worktree).
+   */
+  canRun(rt: RuntimeLike, policy: WorktreePolicy, parallelN = 1): boolean {
     if (policy === "parallel") return true;
     const w = rt.state.worktree;
-    const cur = this.memOwner.get(w);
-    if (cur && cur !== rt.state.sessionID) return false;
+    const key = `${w}:${rt.state.sessionID}`;
+    if (this.counted.has(key)) return true; // idempotent (already counted)
     if (!this.fileOwned.has(w)) {
-      if (!this.tryAcquireFile(rt)) return false;
+      if (!this.tryAcquireFile(rt)) return false; // another process holds the sit
     }
-    this.memOwner.set(w, rt.state.sessionID);
+    const cur = this.memCount.get(w) ?? 0;
+    if (cur >= parallelN) return false; // same-process slot limit reached
+    this.memCount.set(w, cur + 1);
+    this.counted.add(key);
     return true;
   }
 
+  /** Clear one local in-flight slot for a worktree (call when a turn ends). */
   releaseLocal(rt: RuntimeLike) {
     const w = rt.state.worktree;
-    if (this.memOwner.get(w) === rt.state.sessionID) this.memOwner.delete(w);
+    const key = `${w}:${rt.state.sessionID}`;
+    if (this.counted.delete(key)) {
+      const cur = this.memCount.get(w) ?? 1;
+      this.memCount.set(w, Math.max(0, cur - 1));
+    }
   }
 
+  /** Fully release a worktree sit (pause/complete/abort). */
   releaseAll(rt: RuntimeLike) {
-    const w = rt.state.worktree;
     this.releaseLocal(rt);
+    const w = rt.state.worktree;
     if (this.fileOwned.has(w)) {
       this.stopHeartbeat(w);
       try {
@@ -538,6 +558,7 @@ export default (async function plugin(input, rawOptions) {
       recovery: o.recovery ?? options.recovery,
       recovery_attempts: o.recovery_attempts ?? options.recovery_attempts,
       worktree_policy: o.worktree_policy ?? options.worktree_policy,
+      worktree_parallel_sessions: Math.max(1, o.worktree_parallel_sessions ?? options.worktree_parallel_sessions),
     };
   }
 
@@ -549,7 +570,7 @@ export default (async function plugin(input, rawOptions) {
         (s.completed ? ` (COMPLETE: ${s.completedReason ?? "n/a"})` : "") +
         (s.paused ? ` (PAUSED: ${s.pausedReason})` : "") +
         `.`,
-      `[goal-run] Config: agent<=${eff.max_parallel_agents}/message; turn silence-timeout ${eff.turn_timeout_s}s; max_auto_turns=${eff.max_auto_turns}; recovery=${eff.recovery}(${eff.recovery_attempts}); worktree=${eff.worktree_policy}. ` +
+      `[goal-run] Config: agent<=${eff.max_parallel_agents}/message; turn silence-timeout ${eff.turn_timeout_s}s; max_auto_turns=${eff.max_auto_turns}; recovery=${eff.recovery}(${eff.recovery_attempts}); worktree=${eff.worktree_policy}(parallel_sessions=${eff.worktree_parallel_sessions}). ` +
         `Rule: only end by calling goal_mark_done with verifiable evidence, OR pause via goal_pause. When stuck, analyze why, use goal_research + web tools to learn, change strategy and keep going. ` +
         (s.mode === "iterate"
           ? `(iterate) Each round: implement→self-test→find gaps→goal_progress(note=...)→engine auto-continues.`
@@ -696,8 +717,8 @@ export default (async function plugin(input, rawOptions) {
 
     const eff = effConfig(rt);
 
-    // Concurrency gate: serial policy allows only one active auto-loop per worktree.
-    if (!arbiter.canRun(rt, eff.worktree_policy)) {
+    // Concurrency gate: serial policy limits in-flight slots per worktree.
+    if (!arbiter.canRun(rt, eff.worktree_policy, eff.worktree_parallel_sessions)) {
       scheduleContinue(rt.state.sessionID);
       return;
     }
@@ -797,6 +818,7 @@ export default (async function plugin(input, rawOptions) {
     if (typeof args.recovery === "string") o.recovery = args.recovery as Recovery;
     if (typeof args.recovery_attempts === "number") o.recovery_attempts = args.recovery_attempts;
     if (typeof args.worktree_policy === "string") o.worktree_policy = args.worktree_policy as WorktreePolicy;
+    if (typeof args.worktree_parallel_sessions === "number") o.worktree_parallel_sessions = Math.max(1, Math.floor(args.worktree_parallel_sessions));
     if (typeof args.no_progress_turns === "number") o.no_progress_turns = args.no_progress_turns;
     if (typeof args.converge_turns === "number") o.converge_turns = args.converge_turns;
     if (typeof args.turn_timeout_s === "number") o.turn_timeout_s = args.turn_timeout_s;
@@ -814,6 +836,7 @@ export default (async function plugin(input, rawOptions) {
         recovery: recoveryEnum.optional(),
         recovery_attempts: z.number().int().nonnegative().optional(),
         worktree_policy: z.enum(["serial", "parallel"]).optional().describe("serial=同一工作目录互斥防冲突(默认); parallel=不互斥、可并行推进"),
+        worktree_parallel_sessions: z.number().int().positive().optional().describe("serial 下同实例内同一工作目录最多并行的会话数(默认1=纯串行)"),
         no_progress_turns: z.number().int().positive().optional(),
         converge_turns: z.number().int().positive().optional(),
         turn_timeout_s: z.number().positive().optional(),
@@ -829,7 +852,7 @@ export default (async function plugin(input, rawOptions) {
         scheduleContinue(ctx.sessionID);
         return (
           `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}\n` +
-          `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}, ` +
+          `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}(parallel=${eff.worktree_parallel_sessions}), ` +
           `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.\n` +
           `Engine runs automatically (shared safely across sessions/instances on this worktree). Use goal_progress/goal_mark_done/goal_configure/goal_pause.`
         );
@@ -844,6 +867,7 @@ export default (async function plugin(input, rawOptions) {
         recovery: recoveryEnum.optional(),
         recovery_attempts: z.number().int().nonnegative().optional(),
         worktree_policy: z.enum(["serial", "parallel"]).optional(),
+        worktree_parallel_sessions: z.number().int().positive().optional(),
         no_progress_turns: z.number().int().positive().optional(),
         converge_turns: z.number().int().positive().optional(),
         turn_timeout_s: z.number().positive().optional(),
@@ -856,7 +880,7 @@ export default (async function plugin(input, rawOptions) {
         applyOverrides(rt.state.overrides, args);
         persist(rt);
         const eff = effConfig(rt);
-        return `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}, no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.`;
+        return `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}(parallel=${eff.worktree_parallel_sessions}), no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.`;
       },
     },
 

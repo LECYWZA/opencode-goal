@@ -66,6 +66,18 @@ await (async () => {
   arb4.releaseLocal(rta);
   check("arb4/rtb runs after local release", arb4.canRun(rtb, "serial") === true);
 
+  // N-way same-instance parallelism (serial policy with slot limit)
+  const arbN = new Arbiter(dir);
+  const q1 = { state: { worktree: "/nway", sessionID: "q1" } };
+  const q2 = { state: { worktree: "/nway", sessionID: "q2" } };
+  const q3 = { state: { worktree: "/nway", sessionID: "q3" } };
+  check("serial n=2 first ok", arbN.canRun(q1, "serial", 2) === true);
+  check("serial n=2 second ok", arbN.canRun(q2, "serial", 2) === true);
+  check("serial n=2 third blocked", arbN.canRun(q3, "serial", 2) === false);
+  arbN.releaseLocal(q1);
+  check("serial n=2 third ok after one release", arbN.canRun(q3, "serial", 2) === true);
+  check("serial n=1 still exclusive", (() => { const a = new Arbiter(dir); const x={state:{worktree:"/x1",sessionID:"x1"}}, y={state:{worktree:"/x1",sessionID:"y1"}}; return a.canRun(x,"serial",1)===true && a.canRun(y,"serial",1)===false; })() === true);
+
   // parallel policy bypasses coordination entirely
   const arbP = new Arbiter(dir);
   const rp1 = { state: { worktree: "/parallel", sessionID: "p1" } };

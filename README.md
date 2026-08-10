@@ -42,7 +42,7 @@ npm run build      # 改源码后必须重新构建
 config 里的参数只是**全局默认值**。每个任务实际生效的参数可以在运行时单独设置，优先级：**本次任务的覆盖 > 全局默认**。三种方式：
 
 1. **内联参数**（目标里直接带，如）：`/my_goal 做一个XX agent=3 max_turns=50 recovery=auto-research worktree_policy=parallel`
-   - 支持：`agent`(并行数) `max_turns`(-1=无限) `recovery`(auto-research/pause/continue) `recovery_attempts` `worktree_policy`(serial/parallel) `no_progress_turns` `converge_turns` `turn_timeout_s`(静默超时) `idle_interval_ms`
+   - 支持：`agent`(并行数) `max_turns`(-1=无限) `recovery`(auto-research/pause/continue) `recovery_attempts` `worktree_policy`(serial/parallel) `worktree_parallel_sessions`(serial下同实例内N路) `no_progress_turns` `converge_turns` `turn_timeout_s`(静默超时) `idle_interval_ms`
 2. **启动时弹选**：未在命令行指定时，命令会用 question 工具**逐项弹出选择**让你确认（并行 agent 数、是否限轮次、无进展处理策略、静默超时秒数、同项目并发策略），无需接触配置文件。
 3. **运行中调整**：随时让模型调用 `goal_configure(agent=…, max_turns=…, recovery=…, …)` 即可改动当前任务参数，不重置进度。
 
@@ -60,7 +60,8 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 | `converge_turns` | `5` | 迭代模式：连续 N 轮无改进视为收敛 |
 | `recovery` | `auto-research` | 受挫时策略：自动分析+搜索+换思路继续 / 暂停等我 / 无条件硬继续 |
 | `recovery_attempts` | `4` | 自我进化恢复轮次上限，用尽仍无进展才暂停 |
-| `worktree_policy` | `serial` | 同项目并发：`serial`=同一工作目录互斥防冲突(默认) / `parallel`=可并行推进不互斥 |
+| `worktree_policy` | `serial` | 同项目并发：`serial`=同一工作目录互斥防冲突(默认) / `parallel`=完全不互斥、自由并行 |
+| `worktree_parallel_sessions` | `1` | `serial` 下同实例内同一项目最多并行会话数：`1`=纯串行；`N`=同实例内 N 路并行(跨实例仍互斥) |
 | `idle_interval_ms` | `2000` | 续跑最小间隔（去抖） |
 | `persist` | `true` | 状态落盘（支持跨重启恢复） |
 | `complete_credential` | `true` | 强制显式完成凭证 |
@@ -122,7 +123,12 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 - **跨 opencode 实例**：每 worktree 一把**排他锁文件 + 心跳刷新 + 陈旧抢占**。被他人持有的实例自动等待；持有者暂停/完成/退出后自动让出，等待者接管。
 - 不同 worktree 完全互不影响，可并行。
 
-> 可切换 `worktree_policy=parallel`（内联、启动弹选或 `goal_configure`）：**不做互斥、同项目可并行推进**，适合想同时改不同文件的激进场景，但需自行注意别互相覆盖。默认 `serial` 保证防冲突。二者为运行时策略，随任务状态落盘。
+> 并发策略为**可选**，三种档位（内联、启动弹选、或 `goal_configure` 随时切换，随状态落盘）：
+> - `worktree_policy=serial` + `worktree_parallel_sessions=1`：纯串行，同项目同一时刻只一个活跃循环（**默认，防冲突**）。
+> - `worktree_policy=serial` + `worktree_parallel_sessions=N`：折中——**同实例内允许 N 路并行**改同一项目，**跨实例仍严格互斥**（不同 opencode 进程只会有一个持有该项目的锁在跑）。
+> - `worktree_policy=parallel`：完全不互斥、可自由并行，适合想彻底放手并行、自己小心不覆盖文件。
+>
+> 说明：`parallel` 或 `serial+N(N>1)` 下多个会话若同时改同一个文件仍可能互相覆盖，这是放开并行的固有权衡。
 
 ## 防卡死设计（学习自旧插件的 bug）
 
