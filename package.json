@@ -1,0 +1,28 @@
+{
+  "name": "opencode-goal-run",
+  "version": "0.1.0",
+  "description": "opencode plugin: goal mode + infinite iterate mode with auto-continue, parallel-agent limit, multi-route brakes, persistence and command-driven resume",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode-ai/plugin --external:@opencode-ai/sdk --outfile=dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "watch": "esbuild src/index.ts --bundle --platform=node --format=esm --external:@opencode-ai/plugin --external:@opencode-ai/sdk --outfile=dist/index.js --watch"
+  },
+  "dependencies": {
+    "zod": "^3.24.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}
