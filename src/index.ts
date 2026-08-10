@@ -5,34 +5,41 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 /* ------------------------------------------------------------------ *
- *  opencode-goal-run
- *  Goal mode + infinite iterate mode with robust auto-continue.
+ *  opencode-goal-run v3
+ *  Goal mode + infinite iterate mode with robust auto-continue and
+ *  SELF-EVOLVING recovery.
  *
- *  Design goals (learning from the old plugin's freeze bug):
- *   - SINGLE-FLIGHT: only one "continue" in flight per session.
- *   - EVENT-DRIVEN, self-chaining loop gated by single-flight + debounce,
- *     so multiple triggers (idle + own completion) can never storm.
- *   - MULTI-ROUTE BRAKES: no-progress / turn-timeout / max-turns /
- *     explicit completion / pause / abort / manual interrupt.
- *   - EXPLICIT CREDENTIALS for completion (model must call goal_mark_done
- *     with evidence) — never silently stop.
- *   - NO blocking work inside event callbacks (schedule via setTimeout),
- *     to avoid freezing on Windows.
- *   - PER-RUN CONFIG: global options are DEFAULTS only; each goal can
- *     carry overrides set at launch time (goal_set / goal_configure) so
- *     the user never has to edit config to change agents/limits.
+ *  Philosophy (v3): instead of freezing or stopping on setbacks, the
+ *  engine DIAGNOSES why there is no progress, RESEARCHES (Bing / GitHub
+ *  / HuggingFace), changes strategy and keeps going. It only stops when
+ *  a verifiable completion is produced, or the user asks, or a recovery
+ *  attempt cap is exhausted (configurable), or the user-chosen max
+ *  turn cap is reached.
+ *
+ *  Safety / anti-freeze (unchanged from v1/v2):
+ *   - SINGLE-FLIGHT: one continue in flight per session.
+ *   - EVENT-DRIVEN loop gated by single-flight + debounce (no storms).
+ *   - NO blocking work in event callbacks (setTimeout scheduling).
+ *   - Use Promise.race + abort so a hung turn can NEVER freeze our loop.
+ *
+ *  Activeness watchdog (v3): a turn "times out" only when the model is
+ *  COMPLETELY SILENT for turn_timeout_s (no tokens emitted, no tool
+ *  activity) — talking/working never counts as timeout.
  * ------------------------------------------------------------------ */
 
 type Mode = "goal" | "iterate" | "off";
+type Recovery = "auto-research" | "pause" | "continue";
 
 interface Options {
   mode: Mode;
   max_parallel_agents: number;
   max_auto_turns: number; // -1 = infinite
-  turn_timeout_s: number;
+  turn_timeout_s: number; // "silence" timeout (active-timeout), not wall-clock
   no_progress_turns: number;
   converge_turns: number;
   idle_interval_ms: number;
+  recovery: Recovery;
+  recovery_attempts: number;
   persist: boolean;
   state_file: string;
   complete_credential: boolean;
@@ -48,6 +55,8 @@ interface RunOverrides {
   converge_turns?: number;
   turn_timeout_s?: number;
   idle_interval_ms?: number;
+  recovery?: Recovery;
+  recovery_attempts?: number;
 }
 
 interface EffectiveRunConfig {
@@ -58,7 +67,11 @@ interface EffectiveRunConfig {
   converge_turns: number;
   turn_timeout_s: number;
   idle_interval_ms: number;
+  recovery: Recovery;
+  recovery_attempts: number;
 }
+
+type TurnEnd = "ok" | "no-progress" | "timeout";
 
 function defaultOptions(raw: Record<string, unknown> | undefined): Options {
   const home = os.homedir();
@@ -72,6 +85,8 @@ function defaultOptions(raw: Record<string, unknown> | undefined): Options {
     no_progress_turns: num(raw?.no_progress_turns, 10),
     converge_turns: num(raw?.converge_turns, 5),
     idle_interval_ms: num(raw?.idle_interval_ms, 2000),
+    recovery: (raw?.recovery as Recovery) ?? "auto-research",
+    recovery_attempts: num(raw?.recovery_attempts, 4),
     persist: raw?.persist !== false,
     state_file: mkPath(raw?.state_file, path.join(home, ".config", "opencode", "goal-run-state.json")),
     complete_credential: raw?.complete_credential !== false,
@@ -111,17 +126,23 @@ interface GoalState {
 interface Runtime {
   state: GoalState;
   running: boolean; // single-flight
-  continuePending: boolean; // a continue is scheduled/queued
+  continuePending: boolean;
   timer: ReturnType<typeof setTimeout> | null;
+  watchdog: ReturnType<typeof setInterval> | null;
   turnStart: number;
-  activity: number; // work-tool executions this turn
+  lastActivity: number;
+  activity: number;
   progressedThisCycle: boolean;
+  timeoutHit: boolean;
+  winnerResolver: (() => void) | null;
+  lastEnd: TurnEnd;
+  recoveryCounter: number;
 }
 
 type Persisted = Record<string, GoalState>;
 
 /* ------------------------------------------------------------------ *
- *  Store (persistence)
+ *  Store
  * ------------------------------------------------------------------ */
 
 class Store {
@@ -136,8 +157,7 @@ class Store {
   load() {
     try {
       if (fs.existsSync(this.file)) {
-        const raw = fs.readFileSync(this.file, "utf8");
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(fs.readFileSync(this.file, "utf8"));
         if (parsed && typeof parsed === "object") this.cache = parsed;
       }
     } catch (e) {
@@ -187,6 +207,88 @@ class Store {
 }
 
 /* ------------------------------------------------------------------ *
+ *  Research helper (aggregate Bing / GitHub / HuggingFace)
+ * ------------------------------------------------------------------ */
+
+async function fetchText(url: string, timeoutMs = 9000): Promise<string> {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: c.signal, headers: { "User-Agent": "goal-run" } });
+    if (!res.ok) return "";
+    return await res.text();
+  } catch (e) {
+    return "";
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function research(query: string): Promise<string> {
+  const q = encodeURIComponent(query);
+  const out: string[] = [`Research: ${query}`];
+
+  // 1) GitHub repositories
+  try {
+    const txt = await fetchText(`https://api.github.com/search/repositories?q=${q}&per_page=5`);
+    if (txt) {
+      const j = JSON.parse(txt);
+      const items = (j?.items ?? []).slice(0, 5);
+      out.push("## GitHub");
+      for (const it of items) {
+        out.push(`- ${it.full_name} — ${(it.description ?? "").slice(0, 180)} (★${it.stargazers_count})`);
+      }
+    }
+  } catch (e) {
+    out.push("## GitHub (error)");
+  }
+
+  // 2) HuggingFace models
+  try {
+    const txt = await fetchText(`https://huggingface.co/api/models?search=${q}&limit=5`);
+    if (txt) {
+      const j = JSON.parse(txt);
+      const items = (j ?? []).slice(0, 5);
+      out.push("## HuggingFace");
+      for (const it of items) {
+        out.push(`- ${it.id} — ${(it.pipeline_tag ?? "")} downloads:${it.downloads ?? "-"}`);
+      }
+    }
+  } catch (e) {
+    out.push("## HuggingFace (error)");
+  }
+
+  // 3) Bing web search (HTML scrape)
+  const bing = await fetchText(`https://www.bing.com/search?q=${q}`);
+  if (bing && bing.length > 0) {
+    const re = /<li class="b_algo"[\s\S]*?<h2><a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<p[\s\S]*?>([\s\S]*?)<\/p>/gi;
+    const results: string[] = [];
+    let m: RegExpExecArray | null;
+    let guard = 0;
+    while ((m = re.exec(bing)) && guard++ < 5) {
+      const title = stripHtml(m[2]).slice(0, 120);
+      const desc = stripHtml(m[3]).slice(0, 240);
+      results.push(`- ${title} — ${m[1]} — ${desc}`);
+    }
+    out.push("## Bing");
+    out.push(...(results.length ? results : ["(no parseable results)"]));
+  } else {
+    out.push("## Bing (unreachable)");
+  }
+
+  return out.join("\n").slice(0, 6000);
+}
+
+/* ------------------------------------------------------------------ *
  *  Plugin
  * ------------------------------------------------------------------ */
 
@@ -209,15 +311,20 @@ export default (async function plugin(input, rawOptions) {
       running: false,
       continuePending: false,
       timer: null,
+      watchdog: null,
       turnStart: 0,
+      lastActivity: Date.now(),
       activity: 0,
       progressedThisCycle: false,
+      timeoutHit: false,
+      winnerResolver: null,
+      lastEnd: "ok",
+      recoveryCounter: 0,
     };
     runtimes.set(state.sessionID, rt);
     return rt;
   }
 
-  /* merge per-run overrides over global defaults */
   function effConfig(rt: Runtime): EffectiveRunConfig {
     const o = rt.state.overrides ?? {};
     return {
@@ -228,62 +335,127 @@ export default (async function plugin(input, rawOptions) {
       converge_turns: o.converge_turns ?? options.converge_turns,
       turn_timeout_s: o.turn_timeout_s ?? options.turn_timeout_s,
       idle_interval_ms: o.idle_interval_ms ?? options.idle_interval_ms,
+      recovery: o.recovery ?? options.recovery,
+      recovery_attempts: o.recovery_attempts ?? options.recovery_attempts,
     };
   }
 
-  /* ---------- system prompt injection ---------- */
+  /* ---------- system prompt ---------- */
   function rulesBlock(rt: Runtime): string[] {
     const s = rt.state;
     const eff = effConfig(rt);
-    const maxAgents = eff.max_parallel_agents;
     const block: string[] = [];
     block.push(
-      `[goal-run] Active objective engine (mode=${s.mode}). Current objective: ${s.objective}` +
-        (s.completed ? ` (marked complete: ${s.completedReason ?? "n/a"})` : "") +
+      `[goal-run] Active objective engine (mode=${s.mode}). Objective: ${s.objective}` +
+        (s.completed ? ` (COMPLETE: ${s.completedReason ?? "n/a"})` : "") +
         (s.paused ? ` (PAUSED: ${s.pausedReason})` : "") +
         `.`
     );
-    if (s.mode === "goal") {
-      block.push(
-        `[goal-run] You are in GOAL mode. Work autonomously toward the objective in rounds. ` +
-          `You may launch at most ${maxAgents} concurrent subagent (task) call(s) per message; if you would need more, run them sequentially. ` +
-          `Each round, if you did work, call goal_progress(note=...) to log it. ` +
-          `When the objective is fully achieved, call goal_mark_done(evidence=..., verification=...) to stop. ` +
-          `Do NOT stop without calling goal_mark_done. If stuck with no way to progress for several rounds, call goal_pause(reason=...) instead.`
-      );
-    } else {
-      block.push(
-        `[goal-run] You are in ITERATE (self-improvement) mode. Loop repeatedly to make the outcome better and better. ` +
-          `Each round you MUST: (1) implement/advance the work, (2) self-test / run checks, (3) assess gaps and identify concrete improvements, ` +
-          `(4) call goal_progress(note=<what you improved this round>) to log the increment, (5) the engine continues automatically. ` +
-          `You may launch at most ${maxAgents} concurrent subagent (task) call(s) per message. ` +
-          `Only stop improving when you genuinely cannot make further meaningful progress (after several rounds of no improvement), and call goal_mark_done(evidence=..., verification=...).`
-      );
-    }
     block.push(
-      `[goal-run] Completion rule: you may only stop the loop by calling goal_mark_done with concrete, verifiable evidence. ` +
-        `To pause/temporarily stop use goal_pause. To change per-run parameters at any time use goal_configure. To query state use goal_status. To extend an already-completed objective, call goal_continue(extra=...).`
+      `[goal-run] Config: agent<=${eff.max_parallel_agents}/message; turn silence-timeout ${eff.turn_timeout_s}s; max_auto_turns=${eff.max_auto_turns}; recovery=${eff.recovery}(${eff.recovery_attempts} attempts). ` +
+        `Rule: only end by calling goal_mark_done with verifiable evidence, OR pause via goal_pause. When you hit a wall (stuck/no progress/no ideas), DO NOT give up: analyze why, use goal_research (Bing/GitHub/HuggingFace) plus web tools to learn, then change strategy and keep going. ` +
+        (s.mode === "iterate"
+          ? `(iterate) Each round: implement→self-test→find gaps→goal_progress(note=...)→engine auto-continues.`
+          : `(goal) Work toward the objective each round; log via goal_progress; finish via goal_mark_done.`)
     );
     return block;
   }
 
-  /* ---------- brakes ---------- */
-  function brakeReason(rt: Runtime): string | undefined {
+  /* ---------- turn text ---------- */
+  function buildTurnText(rt: Runtime, eff: EffectiveRunConfig, runs: number): string {
     const s = rt.state;
-    if (s.completed) return undefined; // handled elsewhere
-    if (s.paused) return undefined;
-    const eff = effConfig(rt);
-    const brakeTurns = eff.mode === "iterate" ? eff.converge_turns : eff.no_progress_turns;
-    if (s.noProgressTurns >= brakeTurns) {
-      return `no meaningful progress for ${s.noProgressTurns} consecutive rounds (threshold ${brakeTurns}).`;
+    let base: string;
+    if (s.mode === "iterate") {
+      base = `[goal-run] Round ${runs}. Continue improving: ${s.objective}. Implement → self-test → find gaps → call goal_progress(note=...) to log this round's increment. Finish only via goal_mark_done.`;
+    } else {
+      base = `[goal-run] Round ${runs}. Continue working toward: ${s.objective}. Do real work with tools. Call goal_progress when you make progress. Finish via goal_mark_done (do not stop without it).`;
     }
+
+    if (eff.recovery === "pause") {
+      return base;
+    }
+
+    if (rt.lastEnd === "timeout") {
+      return (
+        base +
+        `\n[recovery] 上一轮因长时间静默被自动中断(可能命令无限等待或无输出)。本轮请: 先说明你上一轮可能卡在哪(用一句话诊断), 用 goal_research 或网络搜索排查正确做法, 长命令请自行加超时, 然后推进并调用 goal_progress 记录进展。别固步自封, 主动换思路。`
+      );
+    }
+    if (rt.lastEnd === "no-progress") {
+      return (
+        base +
+        `\n[recovery] 上一轮未产生可验证进展。本轮请: (1)冷静分析为何无进展(卡点/缺条件/方法是否错误); (2)用 goal_research(Bing/GitHub/HuggingFace) 或网络搜索查找相关解法; (3)提出并实施修正方案; (4)调用 goal_progress 记录结果或说明仍受阻的根本原因。主动进化, 不要重复同样无效的动作。`
+      );
+    }
+    return base;
+  }
+
+  /* ---------- completion / brakes / recovery ---------- */
+  function handleTurnEnd(rt: Runtime, eff: EffectiveRunConfig) {
+    const s = rt.state;
+
+    // call-to-stop: completed or user paused during the turn
+    if (s.completed) {
+      persist(rt);
+      return;
+    }
+    if (s.paused) {
+      persist(rt);
+      return;
+    }
+
+    const progressed = rt.progressedThisCycle || rt.activity > 0;
+    if (progressed) {
+      s.noProgressTurns = 0;
+      s.lastActivityAt = Date.now();
+      rt.recoveryCounter = 0;
+      rt.lastEnd = "ok";
+    } else {
+      s.noProgressTurns += 1;
+      rt.lastEnd = rt.timeoutHit ? "timeout" : "no-progress";
+    }
+
+    // user-chosen hard cap always stops (pause)
     if (eff.max_auto_turns >= 0 && s.turns >= eff.max_auto_turns) {
-      return `reached configured max_auto_turns (${eff.max_auto_turns}).`;
+      pause(rt, `reached user-chosen max_auto_turns (${eff.max_auto_turns}).`);
+      return;
     }
-    if (rt.running && eff.turn_timeout_s > 0 && Date.now() - rt.turnStart > eff.turn_timeout_s * 1000) {
-      return `turn exceeded ${eff.turn_timeout_s}s timeout.`;
+
+    const brakeTurns = eff.mode === "iterate" ? eff.converge_turns : eff.no_progress_turns;
+
+    if (eff.recovery === "pause") {
+      if (s.noProgressTurns >= brakeTurns) {
+        pause(rt, `no meaningful progress for ${s.noProgressTurns} rounds (threshold ${brakeTurns}).`);
+        return;
+      }
+      // turn timeout in pause-mode also pauses
+      if (rt.lastEnd === "timeout") {
+        pause(rt, `a turn was silent for >${eff.turn_timeout_s}s.`);
+        return;
+      }
+      // otherwise continue next round
+      scheduleContinue(rt.state.sessionID);
+      return;
     }
-    return undefined;
+
+    // auto-research / continue: do NOT stop on no-progress or timeout,
+    // continue into a diagnosis/research round. Only give up after cap.
+    if (eff.recovery === "auto-research") {
+      const stuck =
+        (rt.lastEnd === "no-progress" && s.noProgressTurns >= brakeTurns) ||
+        rt.lastEnd === "timeout";
+      if (stuck) {
+        rt.recoveryCounter += 1;
+        log("recovery attempt", rt.recoveryCounter, "of", eff.recovery_attempts);
+        if (rt.recoveryCounter > eff.recovery_attempts) {
+          pause(rt, `no progress after ${eff.recovery_attempts} recovery/research rounds.`);
+          return;
+        }
+      }
+    }
+    // "continue" mode: never pause for progress (max_turns / completion only)
+
+    scheduleContinue(rt.state.sessionID);
   }
 
   function pause(rt: Runtime, reason: string) {
@@ -292,21 +464,48 @@ export default (async function plugin(input, rawOptions) {
     if (rt.timer) clearTimeout(rt.timer);
     rt.timer = null;
     rt.continuePending = false;
+    stopWatchdog(rt);
     persist(rt);
   }
 
-  /* ---------- persistence sync ---------- */
   function persist(rt: Runtime) {
     if (options.persist) store.set(rt.state.sessionID, { ...rt.state });
   }
 
-  /* ---------- continue scheduling (single-flight + debounce) ---------- */
+  /* ---------- watchdog (silence = activity timeout) ---------- */
+  function startWatchdog(rt: Runtime, eff: EffectiveRunConfig) {
+    stopWatchdog(rt);
+    if (eff.turn_timeout_s <= 0) return;
+    rt.watchdog = setInterval(() => {
+      if (!rt.running) return;
+      if (Date.now() - rt.lastActivity > eff.turn_timeout_s * 1000) {
+        rt.timeoutHit = true;
+        log("silence timeout; aborting turn", rt.state.sessionID);
+        // resolve the winner so doContinue can proceed (control flow never freezes)
+        if (rt.winnerResolver) rt.winnerResolver();
+        try {
+          void client.session.abort({ path: { id: rt.state.sessionID } });
+        } catch (e) {
+          log("abort error", e);
+        }
+      }
+    }, 1000);
+  }
+
+  function stopWatchdog(rt: Runtime) {
+    if (rt.watchdog) {
+      clearInterval(rt.watchdog);
+      rt.watchdog = null;
+    }
+  }
+
+  /* ---------- scheduling ---------- */
   function scheduleContinue(sessionID: string) {
     const rt = getRuntime(sessionID);
     if (!rt) return;
     const s = rt.state;
     if (s.completed || s.paused) return;
-    if (rt.running || rt.continuePending) return; // single-flight + no storm
+    if (rt.running || rt.continuePending) return; // single-flight
     const eff = effConfig(rt);
     rt.continuePending = true;
     rt.timer = setTimeout(() => {
@@ -316,68 +515,63 @@ export default (async function plugin(input, rawOptions) {
     }, eff.idle_interval_ms);
   }
 
-  function continueText(rt: Runtime): string {
-    const s = rt.state;
-    if (s.mode === "iterate") {
-      return (
-        `[goal-run] Round ${s.turns + 1}. Continue the improvement loop on: ${s.objective}. ` +
-        `Implement, self-test, find improvements, then call goal_progress(note=...) to log this round's increment. ` +
-        `When truly done, call goal_mark_done(evidence=..., verification=...).`
-      );
-    }
-    return (
-      `[goal-run] Round ${s.turns + 1}. Continue working toward the objective: ${s.objective}. ` +
-      `Do useful work with tools each round. Call goal_progress(note=...) if you made progress. ` +
-      `When the objective is fully achieved, call goal_mark_done(evidence=..., verification=...).`
-    );
-  }
-
   async function doContinue(rt: Runtime) {
     if (rt.running) return;
+    const eff = effConfig(rt);
     rt.state.turns += 1;
     rt.turnStart = Date.now();
+    rt.lastActivity = Date.now();
     rt.activity = 0;
     rt.progressedThisCycle = false;
+    rt.timeoutHit = false;
     rt.running = true;
+
+    const text = buildTurnText(rt, eff, rt.state.turns);
+    let winnerResolve: (() => void) | null = null;
+    const winner = new Promise<void>((res) => {
+      winnerResolve = res;
+    });
+    rt.winnerResolver = winnerResolve;
+
+    startWatchdog(rt, eff);
+
     try {
-      const result = await client.session.prompt({
-        path: { id: rt.state.sessionID },
-        body: { parts: [{ type: "text", text: continueText(rt) }] },
-      });
+      const result = await Promise.race([
+        client.session.prompt({
+          path: { id: rt.state.sessionID },
+          body: { parts: [{ type: "text", text }] },
+        }),
+        winner,
+      ]);
       void result;
     } catch (e) {
       log("prompt error", e);
     } finally {
+      stopWatchdog(rt);
+      rt.winnerResolver = null;
       rt.running = false;
-      if (rt.progressedThisCycle || rt.activity > 0) {
-        rt.state.noProgressTurns = 0;
-        rt.state.lastActivityAt = Date.now();
-      } else {
-        rt.state.noProgressTurns += 1;
-        log("no progress in turn", rt.state.turns, "count", rt.state.noProgressTurns);
-      }
-      persist(rt);
-
-      const brake = brakeReason(rt);
-      if (brake) {
-        pause(rt, brake);
-      } else if (rt.state.completed || rt.state.paused) {
-        // stop
-      } else {
-        scheduleContinue(rt.state.sessionID);
-      }
+      handleTurnEnd(rt, eff);
     }
   }
 
-  /* ---------- event hook ---------- */
+  /* ---------- events ---------- */
   async function onEvent({ event }: { event: any }) {
     try {
       if (!event || !event.type) return;
       if (event.type === "session.idle") {
         const sessionID = event.properties?.sessionID as string;
         const rt = getRuntime(sessionID);
-        if (!rt) return;
-        scheduleContinue(sessionID);
+        if (rt) scheduleContinue(sessionID);
+        return;
+      }
+      // model is emitting text -> it is alive, reset silence timer
+      if (event.type === "message.part.updated") {
+        const sessionID = event.properties?.sessionID as string | undefined;
+        const delta = event.properties?.delta;
+        if (sessionID && typeof delta === "string" && delta.length > 0) {
+          const rt = getRuntime(sessionID);
+          if (rt) rt.lastActivity = Date.now();
+        }
       }
     } catch (e) {
       log("event error", e);
@@ -403,6 +597,8 @@ export default (async function plugin(input, rawOptions) {
       rt.state.turns = 0;
       rt.state.noProgressTurns = 0;
       rt.state.progressLog = [];
+      rt.recoveryCounter = 0;
+      rt.lastEnd = "ok";
       return rt;
     }
     const state: GoalState = {
@@ -424,46 +620,46 @@ export default (async function plugin(input, rawOptions) {
     return rt;
   }
 
+  const recoveryEnum = z.enum(["auto-research", "pause", "continue"]);
+
   const tools = {
     goal_set: {
-      description: `Start or overwrite an autonomous objective. Use when the user wants the AI to keep working by itself until done. Requires goal. Optionally set per-run parameters here (they override global defaults for THIS task only). Available per-run params: agent (concurrent subagents), max_turns (-1=infinite), no_progress_turns, converge_turns, turn_timeout_s, idle_interval_ms.`,
+      description: `Start or overwrite an autonomous objective that keeps running by itself. Requires goal. Optional per-run params (override global defaults for THIS task): agent, max_turns(-1=infinite), recovery(how to handle no-progress: auto-research=browse+change strategy and keep going / pause=wait for user / continue=never stop), recovery_attempts, no_progress_turns, converge_turns, turn_timeout_s(silence timeout), idle_interval_ms.`,
       args: {
         goal: z.string().describe("The concrete objective to pursue autonomously."),
-        mode: z.enum(["goal", "iterate"]).optional().describe('"goal" = run until complete; "iterate" = keep improving until convergence.'),
-        agent: z.number().int().positive().optional().describe("Max concurrent subagent(task) calls for this task."),
-        max_turns: z.number().int().optional().describe("Auto-run turn cap, -1 = unlimited."),
-        no_progress_turns: z.number().int().positive().optional().describe("Goal mode: pause after this many consecutive no-progress rounds."),
-        converge_turns: z.number().int().positive().optional().describe("Iterate mode: pause after this many consecutive no-improvement rounds."),
-        turn_timeout_s: z.number().positive().optional().describe("Per-turn timeout in seconds."),
-        idle_interval_ms: z.number().positive().optional().describe("Minimum interval between auto-continues (ms)."),
+        mode: z.enum(["goal", "iterate"]).optional(),
+        agent: z.number().int().positive().optional(),
+        max_turns: z.number().int().optional(),
+        recovery: recoveryEnum.optional(),
+        recovery_attempts: z.number().int().nonnegative().optional(),
+        no_progress_turns: z.number().int().positive().optional(),
+        converge_turns: z.number().int().positive().optional(),
+        turn_timeout_s: z.number().positive().optional(),
+        idle_interval_ms: z.number().positive().optional(),
       },
       execute: async (args: any, ctx: any) => {
         const mode: Exclude<Mode, "off"> = args.mode === "iterate" ? "iterate" : "goal";
         const rt = ensureRt(ctx.sessionID, ctx.worktree, ctx.directory, mode, args.goal);
         if (!rt.state.overrides) rt.state.overrides = {};
-        if (args.agent !== undefined) rt.state.overrides.max_parallel_agents = args.agent;
-        if (args.max_turns !== undefined) rt.state.overrides.max_auto_turns = args.max_turns;
-        if (args.no_progress_turns !== undefined) rt.state.overrides.no_progress_turns = args.no_progress_turns;
-        if (args.converge_turns !== undefined) rt.state.overrides.converge_turns = args.converge_turns;
-        if (args.turn_timeout_s !== undefined) rt.state.overrides.turn_timeout_s = args.turn_timeout_s;
-        if (args.idle_interval_ms !== undefined) rt.state.overrides.idle_interval_ms = args.idle_interval_ms;
+        applyOverrides(rt.state.overrides, args);
         persist(rt);
         const eff = effConfig(rt);
         return (
-          `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}.\n` +
-          `Per-run config (effective): agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, ` +
-          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, ` +
-          `turn_timeout_s=${eff.turn_timeout_s}, idle_interval_ms=${eff.idle_interval_ms}.\n` +
-          `The engine will keep running automatically. Log progress with goal_progress; finish with goal_mark_done; change params anytime with goal_configure.`
+          `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}\n` +
+          `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), ` +
+          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.\n` +
+          `Engine runs automatically. Use goal_progress to log, goal_mark_done to finish, goal_configure to change params, goal_pause/ goal_resume to pause/resume.`
         );
       },
     },
 
     goal_configure: {
-      description: `Change per-run parameters of the active objective at any time (does NOT reset progress). Supported: agent, max_turns, no_progress_turns, converge_turns, turn_timeout_s, idle_interval_ms.`,
+      description: `Change per-run parameters of the active objective at any time (does NOT reset progress). Same params as goal_set.`,
       args: {
         agent: z.number().int().positive().optional(),
         max_turns: z.number().int().optional(),
+        recovery: recoveryEnum.optional(),
+        recovery_attempts: z.number().int().nonnegative().optional(),
         no_progress_turns: z.number().int().positive().optional(),
         converge_turns: z.number().int().positive().optional(),
         turn_timeout_s: z.number().positive().optional(),
@@ -473,24 +669,18 @@ export default (async function plugin(input, rawOptions) {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective; call goal_set first.";
         if (!rt.state.overrides) rt.state.overrides = {};
-        if (args.agent !== undefined) rt.state.overrides.max_parallel_agents = args.agent;
-        if (args.max_turns !== undefined) rt.state.overrides.max_auto_turns = args.max_turns;
-        if (args.no_progress_turns !== undefined) rt.state.overrides.no_progress_turns = args.no_progress_turns;
-        if (args.converge_turns !== undefined) rt.state.overrides.converge_turns = args.converge_turns;
-        if (args.turn_timeout_s !== undefined) rt.state.overrides.turn_timeout_s = args.turn_timeout_s;
-        if (args.idle_interval_ms !== undefined) rt.state.overrides.idle_interval_ms = args.idle_interval_ms;
+        applyOverrides(rt.state.overrides, args);
         persist(rt);
         const eff = effConfig(rt);
         return (
-          `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, ` +
-          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, ` +
-          `turn_timeout_s=${eff.turn_timeout_s}, idle_interval_ms=${eff.idle_interval_ms}.`
+          `Per-run config updated. Effective: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), ` +
+          `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.`
         );
       },
     },
 
     goal_progress: {
-      description: `Log progress / an improvement increment for the current objective, and signal the engine to keep going (resets the no-progress counter).`,
+      description: `Log progress / an improvement increment, and signal the engine to keep going (resets no-progress & recovery counters).`,
       args: {
         note: z.string().describe("What was accomplished or improved this round (concrete)."),
         improved: z.boolean().optional().describe("For iterate mode: true if this round produced a real improvement."),
@@ -502,18 +692,19 @@ export default (async function plugin(input, rawOptions) {
         rt.state.lastActivityAt = Date.now();
         rt.state.lastNote = args.note;
         rt.state.progressLog.push(`[r${rt.state.turns}] ${args.note}`);
-        if (rt.progressedThisCycle === false) rt.progressedThisCycle = true;
+        rt.progressedThisCycle = true;
         rt.activity += 1;
+        if (rt.lastActivity < Date.now()) rt.lastActivity = Date.now();
         persist(rt);
         return `Progress logged (improved=${args.improved === true}). Keep going.`;
       },
     },
 
     goal_mark_done: {
-      description: `Declare the objective complete and STOP the automatic loop. Provide concrete, verifiable evidence. Only call when truly finished.`,
+      description: `Declare the objective complete and STOP the loop. Provide concrete, verifiable evidence. Only call when truly done.`,
       args: {
-        evidence: z.string().describe("Concrete evidence the goal is met (e.g. tests pass, files produced, concrete result)."),
-        verification: z.string().optional().describe("How the result was verified (e.g. 'npm test passes', 'curl returns 200')."),
+        evidence: z.string().describe("Concrete evidence the goal is met."),
+        verification: z.string().optional().describe("How it was verified."),
       },
       execute: async (args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
@@ -525,6 +716,7 @@ export default (async function plugin(input, rawOptions) {
         if (rt.timer) clearTimeout(rt.timer);
         rt.timer = null;
         rt.continuePending = false;
+        stopWatchdog(rt);
         persist(rt);
         let reply = `Objective marked COMPLETE. Evidence: ${args.evidence}`;
         if (args.verification) reply += ` | Verified: ${args.verification}`;
@@ -536,11 +728,20 @@ export default (async function plugin(input, rawOptions) {
       },
     },
 
-    goal_continue: {
-      description: `Resume the loop after a completed objective (deepen/extend it), optionally with a new/refined objective.`,
+    goal_research: {
+      description: `Self-evolution helper: search Bing (web), GitHub repos, and HuggingFace for material/vibe related to a topic, to unblock when stuck. Use it when you have no idea how to proceed.`,
       args: {
-        objective: z.string().optional().describe("Optional new or refined objective to pursue."),
+        query: z.string().describe("Search query (topic / error / library / technique)."),
       },
+      execute: async (args: any) => {
+        const text = await research(args.query);
+        return text || "No results returned.";
+      },
+    },
+
+    goal_continue: {
+      description: `Resume/continue the loop after completion, optionally with a new/refined objective.`,
+      args: { objective: z.string().optional() },
       execute: async (args: any, ctx: any) => {
         let rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective; call goal_set first.";
@@ -551,6 +752,8 @@ export default (async function plugin(input, rawOptions) {
         rt.state.pausedReason = undefined;
         rt.state.turns = 0;
         rt.state.noProgressTurns = 0;
+        rt.recoveryCounter = 0;
+        rt.lastEnd = "ok";
         persist(rt);
         scheduleContinue(ctx.sessionID);
         return `Loop resumed. Continuing: ${rt.state.objective}`;
@@ -558,10 +761,8 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_pause: {
-      description: `Pause the automatic loop now (keep state; resume later with goal_resume). Use if you are genuinely stuck and cannot progress.`,
-      args: {
-        reason: z.string().describe("Why you are pausing."),
-      },
+      description: `Pause the loop now (keep state; resume later). Use if the user wants a break.`,
+      args: { reason: z.string().describe("Why pausing.") },
       execute: async (args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective.";
@@ -571,10 +772,8 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_resume: {
-      description: `Resume the automatic loop for a paused objective.`,
-      args: {
-        objective: z.string().optional().describe("Optional new objective to override."),
-      },
+      description: `Resume the loop for a paused objective.`,
+      args: { objective: z.string().optional() },
       execute: async (args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No paused objective.";
@@ -583,6 +782,8 @@ export default (async function plugin(input, rawOptions) {
         rt.state.pausedReason = undefined;
         rt.state.completed = false;
         rt.state.noProgressTurns = 0;
+        rt.recoveryCounter = 0;
+        rt.lastEnd = "ok";
         persist(rt);
         scheduleContinue(ctx.sessionID);
         return `Loop resumed: ${rt.state.objective}`;
@@ -590,14 +791,13 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_status: {
-      description: `Return the current goal-run engine status (including effective config) for this session.`,
+      description: `Return current engine status (incl. effective config) for this session.`,
       args: {},
       execute: async (_args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective in this session.";
         const s = rt.state;
         const eff = effConfig(rt);
-        const brake = brakeReason(rt);
         return JSON.stringify(
           {
             mode: s.mode,
@@ -608,7 +808,8 @@ export default (async function plugin(input, rawOptions) {
             completedReason: s.completedReason,
             turns: s.turns,
             noProgressTurns: s.noProgressTurns,
-            brakeActive: !!brake,
+            recoveryCounter: rt.recoveryCounter,
+            lastEnd: rt.lastEnd,
             progressLog: s.progressLog,
             effectiveConfig: eff,
           },
@@ -619,12 +820,13 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_abort: {
-      description: `Abort and clear the active goal in this session (engine stops, state removed).`,
+      description: `Abort and clear the active goal in this session (stops engine, removes state).`,
       args: {},
       execute: async (_args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
         if (!rt) return "No active objective.";
         if (rt.timer) clearTimeout(rt.timer);
+        stopWatchdog(rt);
         runtimes.delete(ctx.sessionID);
         if (options.persist) store.remove(ctx.sessionID);
         return "Objective aborted and cleared.";
@@ -632,7 +834,7 @@ export default (async function plugin(input, rawOptions) {
     },
 
     goal_list_incomplete: {
-      description: `List persisted incomplete (paused / not-completed) objectives across sessions, for cross-restart resume.`,
+      description: `List persisted incomplete objectives for cross-restart resume.`,
       args: {},
       execute: async () => {
         const recs = store
@@ -654,16 +856,30 @@ export default (async function plugin(input, rawOptions) {
     },
   };
 
+  function applyOverrides(o: RunOverrides, args: Record<string, unknown>) {
+    if (typeof args.agent === "number") o.max_parallel_agents = args.agent;
+    if (typeof args.max_turns === "number") o.max_auto_turns = args.max_turns;
+    if (typeof args.recovery === "string") o.recovery = args.recovery as Recovery;
+    if (typeof args.recovery_attempts === "number") o.recovery_attempts = args.recovery_attempts;
+    if (typeof args.no_progress_turns === "number") o.no_progress_turns = args.no_progress_turns;
+    if (typeof args.converge_turns === "number") o.converge_turns = args.converge_turns;
+    if (typeof args.turn_timeout_s === "number") o.turn_timeout_s = args.turn_timeout_s;
+    if (typeof args.idle_interval_ms === "number") o.idle_interval_ms = args.idle_interval_ms;
+  }
+
   /* ---------- hooks ---------- */
   return {
     event: onEvent,
 
     tool: tools as any,
 
-    "tool.execute.before": async ({ sessionID, tool: t }: any, output: any) => {
+    "tool.execute.before": async ({ sessionID }: any, output: any) => {
       void output;
       const rt = sessionID ? getRuntime(sessionID) : undefined;
-      if (rt && rt.running) rt.activity += 1;
+      if (rt && rt.running) {
+        rt.activity += 1;
+        rt.lastActivity = Date.now();
+      }
     },
 
     "experimental.chat.system.transform": async (input: any, output: any) => {
