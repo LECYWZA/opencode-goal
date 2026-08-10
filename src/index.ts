@@ -449,7 +449,7 @@ export default (async function plugin(input, rawOptions) {
         if (args.verification) reply += ` | Verified: ${args.verification}`;
         reply += `. The loop has stopped.`;
         if (options.human_gate) {
-          reply += ` Reply "继续"/"${options.command_keyword}" for the model to deepen/extend it via goal_continue, or start something new with goal_set.`;
+          reply += ` Reply "${options.command_keyword}" for the model to deepen/extend it via goal_continue, or start something new with goal_set.`;
         }
         return reply;
       },
