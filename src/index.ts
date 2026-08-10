@@ -1220,6 +1220,72 @@ export default (async function plugin(input, rawOptions) {
         return JSON.stringify(recs, null, 2);
       },
     },
+
+    goal_delete: {
+      description: `Delete one or more objectives by session id or keyword (keyword matches sessionID/worktree/objective, case-insensitive). ALWAYS stops the engine first: cancels continuation timer & watchdog, releases the worktree lock/sit, then removes persisted state. With no args, deletes the current session's active objective. Use it to clean up historical tasks stuck in store too.`,
+      args: {
+        id: z.string().optional().describe("Exact session id to delete"),
+        match: z.string().optional().describe("Keyword matched against sessionID/worktree/objective (case-insensitive)"),
+      },
+      execute: async (args: any, ctx: any) => {
+        const pick = (id: string, worktree: string, objective: string): boolean => {
+          if (args.id) return id === args.id;
+          if (args.match && String(args.match).trim()) {
+            const kw = String(args.match).trim().toLowerCase();
+            return `${id}\n${worktree}\n${objective}`.toLowerCase().includes(kw);
+          }
+          return id === ctx.sessionID;
+        };
+        const targets = store.all().filter((s) => pick(s.sessionID, s.worktree, s.objective));
+
+        // Fallback: no args & nothing persisted → operate on the current live run directly.
+        if (targets.length === 0 && !args.id && !args.match) {
+          const rt = getRuntime(ctx.sessionID);
+          if (rt) {
+            if (rt.timer) clearTimeout(rt.timer);
+            rt.timer = null;
+            rt.continuePending = false;
+            stopWatchdog(rt);
+            arbiter.releaseAll(rt);
+            runtimes.delete(ctx.sessionID);
+            if (options.persist) store.remove(ctx.sessionID);
+            await store.flush();
+            return `Objective aborted and deleted for current session ${ctx.sessionID} (engine stopped, lock released, state cleared).`;
+          }
+        }
+
+        if (targets.length === 0) {
+          const avail = store.all().map((s) => `  - ${s.sessionID} :: ${s.worktree} :: ${s.objective.slice(0, 80)}`);
+          return (
+            `No matching objective to delete (matched against sessionID/worktree/objective).\n` +
+            `Available persisted objectives:\n` +
+            (avail.length ? avail.join("\n") : "  (none)")
+          );
+        }
+
+        const deleted: Array<{ sessionID: string; worktree: string; objective: string }> = [];
+        for (const s of targets) {
+          const rt = getRuntime(s.sessionID);
+          if (rt) {
+            if (rt.timer) clearTimeout(rt.timer);
+            rt.timer = null;
+            rt.continuePending = false;
+            stopWatchdog(rt);
+            arbiter.releaseAll(rt);
+            runtimes.delete(s.sessionID);
+          }
+          store.remove(s.sessionID);
+          deleted.push({ sessionID: s.sessionID, worktree: s.worktree, objective: s.objective });
+        }
+        await store.flush();
+        const remaining = store.all().filter((s) => !s.completed).length;
+        return (
+          `Deleted ${deleted.length} objective(s) (engine stopped → lock released → state cleared):\n` +
+          deleted.map((d) => `  - [${d.sessionID}] ${d.worktree}\n    ${d.objective.slice(0, 160)}`).join("\n") +
+          `\nRemaining incomplete persisted objectives: ${remaining}.`
+        );
+      },
+    },
   };
 
   return {
