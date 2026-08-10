@@ -1,11 +1,12 @@
 import def from "../dist/index.js";
 
-let promptCalls = 0;
+const counter = {};
 const input = {
   client: {
     session: {
-      prompt: async () => {
-        promptCalls++;
+      prompt: async (opts) => {
+        const sid = opts.path.id;
+        counter[sid] = (counter[sid] || 0) + 1;
         return { info: { id: "m" }, parts: [] };
       },
       abort: async () => {},
@@ -58,12 +59,12 @@ const hooks2 = await def(input, {
 });
 const t2 = hooks2.tool;
 await t2.goal_set.execute({ goal: "no-progress but keep going", mode: "goal" }, ctx2);
-const callsBefore = promptCalls;
+const callsBefore = counter["s2"] || 0;
 await hooks2.event({ event: { type: "session.idle", properties: { sessionID: "s2" } } });
 await sleep(10);
 // engine should still be running recovery rounds (not paused immediately)
 let st2 = JSON.parse(await t2.goal_status.execute({}, ctx2));
-const callsGrew = promptCalls - callsBefore;
+const callsGrew = (counter["s2"] || 0) - callsBefore;
 console.log("s2 auto-research: paused now?=", st2.paused, "| new prompt calls so far:", callsGrew);
 // wait for recovery attempts to be exhausted -> pause
 await sleep(60);
@@ -83,9 +84,9 @@ console.log("s3 after configure agent:", st3.effectiveConfig.max_parallel_agents
 await tools.goal_resume.execute({}, ctx);
 await tools.goal_progress.execute({ note: "done core", improved: true }, ctx);
 console.log(await tools.goal_mark_done.execute({ evidence: "tests green", verification: "npm test" }, ctx));
-const before = promptCalls;
+const before = counter["s1"] || 0;
 await sleep(30);
-console.log("s1 no increase after complete:", promptCalls === before);
+console.log("s1 no increase after complete:", (counter["s1"] || 0) === before);
 
 console.log("\nSMOKE OK");
 process.exit(0);
