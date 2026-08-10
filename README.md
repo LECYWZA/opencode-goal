@@ -62,7 +62,7 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 | `recovery_attempts` | `4` | 自我进化恢复轮次上限，用尽仍无进展才暂停 |
 | `worktree_policy` | `serial` | 同项目并发：`serial`=同一工作目录互斥防冲突(默认) / `parallel`=完全不互斥、自由并行 |
 | `worktree_parallel_sessions` | `1` | `serial` 下同实例内同一项目最多并行会话数：`1`=纯串行；`N`=同实例内 N 路并行(跨实例仍互斥) |
-| `thinking_stall_s` | `120` | 死循环检测：持续输出但长时间不动手(秒) → 思考空转死循环 |
+| `thinking_stall_s` | `600` | 死循环检测：持续输出但长时间不动手(秒=10分钟) → 思考空转死循环 |
 | `max_repeats` | `5` | 死循环检测：连续相同内容输出次数 → 重复死循环 |
 | `max_tool_loop` | `5` | 死循环检测：连续相同(工具+参数)调用次数 → 工具循环死循环 |
 | `idle_interval_ms` | `2000` | 续跑最小间隔（去抖） |
@@ -143,7 +143,7 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 
 | 信号 | 触发 | 配置项 |
 |---|---|---|
-| 思考空转 | 模型持续输出 token，但长时间（默认120s）没有任何工具动作 → thinking-stall | `thinking_stall_s` |
+| 思考空转 | 模型持续输出 token，但长时间（默认10分钟）没有任何工具动作 → thinking-stall | `thinking_stall_s` |
 | 重复输出 | 连续输出完全相同内容达到次数（默认5）→ repeat-output | `max_repeats` |
 | 工具循环 | 连续相同(工具+参数)调用达到次数（默认5）→ tool-loop | `max_tool_loop` |
 
