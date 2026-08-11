@@ -61,6 +61,23 @@ npm run build && npm run build:cli
 # 同步 command/*.md（若有更新）；重启 opencode
 ```
 
+## TUI 插件（零模型管理，原生列表交互）
+
+任务**管理**走 TUI 组件、不依赖大模型（复用 goal-cli + state 文件作为脚本底座）。命令一律 `/my_` 前缀、出现在 `/` 命令列表：
+
+| TUI 命令 | 作用 |
+|---|---|
+| `/my_new` | **创建向导**：输入目标 → 选 目标/固定迭代(自填次数,0=无限)/无限 → 参数逐项「选项 + 自定义输入」→ 确认后交给会话执行 `goal_set`（创建允许一次模型） |
+| `/my_goal_manager` | **任务管理面板**：按当前目录优先列出任务（原生选择菜单）→ 查看详情 / 暂停保留 / 彻底停止 / 先停再删 / 恢复 / 编辑目标，全部零模型执行 |
+| `/my_sessions` | **跨项目会话浏览**：拉取全部 session 按项目目录分组 → 选择即切换会话与目录 |
+
+安装步骤：
+1. 构建：`npm run build:tui` 生成 `dist/tui.js`；
+2. 在 `~/.config/opencode/tui.jsonc` 的 `"plugin"` 数组加入本地产物：`"C:/Users/<you>/opencode-goal-run/dist/tui.js"`；
+3. 重启 opencode（tui.jsonc 与插件仅启动时加载）。
+
+> 说明：TUI 插件机制、`/my_new`、`/my_goal_manager`、`/my_sessions` 需要 opencode 支持 **TUI 插件**（`tui.jsonc` 的 `plugin` 加载，参考成熟实现 opencode-tui-utils）。若目标版本不支持，改回用下方 `/my_goal` 等对话命令与 `goal-cli`（均可用）。原 `/my_goal`、`/my_iterate`、`/my_infinite`（创建）与 `/my_goal_status`/`/my_goal_stop`/`/my_goal_delete`/`/my_goal_edit`/`/my_goal_restore`（管理）作为**兜底**保留。
+
 ## 使用
 
 | 命令 | 作用 |
