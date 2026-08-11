@@ -27,7 +27,7 @@ import * as crypto from "node:crypto";
  *          wait; owner releasing/exiting lets them take over.
  * ------------------------------------------------------------------ */
 
-type Mode = "goal" | "iterate" | "off";
+type Mode = "goal" | "iterate" | "infinite" | "off";
 type Recovery = "auto-research" | "pause" | "continue";
 type WorktreePolicy = "serial" | "parallel";
 
@@ -630,7 +630,9 @@ export default (async function plugin(input, rawOptions) {
   function buildTurnText(rt: Runtime, eff: EffectiveRunConfig, runs: number): string {
     const s = rt.state;
     let base =
-      s.mode === "iterate"
+      s.mode === "infinite"
+        ? `[goal-run] Round ${runs} (INFINITE mode: never stops on its own). Continue improving: ${s.objective}. Implement → self-test → find gaps → call goal_progress(note=...) to log this round's increment. INFINITE RULE: do NOT call goal_mark_done just because it looks converged or you're out of ideas — change strategy, research, and keep going. Only call goal_mark_done (or tell the user they may stop) when the user explicitly asks to finish/stop. The engine ignores 'no progress for N rounds' and 'recovery exhausted'; it stops ONLY via goal_pause/manual stop.`
+        : s.mode === "iterate"
         ? `[goal-run] Round ${runs}. Continue improving: ${s.objective}. Implement → self-test → find gaps → call goal_progress(note=...) to log this round's increment. Finish only via goal_mark_done.`
         : `[goal-run] Round ${runs}. Continue working toward: ${s.objective}. Do real work with tools. Call goal_progress when you make progress. Finish via goal_mark_done (do not stop without it).`;
 
@@ -694,14 +696,15 @@ export default (async function plugin(input, rawOptions) {
       return;
     }
 
+    const infinite = eff.mode === "infinite";
     const brakeTurns = eff.mode === "iterate" ? eff.converge_turns : eff.no_progress_turns;
 
     if (eff.recovery === "pause") {
-      if (s.noProgressTurns >= brakeTurns) {
+      if (!infinite && s.noProgressTurns >= brakeTurns) {
         pause(rt, `no meaningful progress for ${s.noProgressTurns} rounds (threshold ${brakeTurns}).`);
         return;
       }
-      if (rt.lastEnd === "loop") {
+      if (!infinite && rt.lastEnd === "loop") {
         pause(rt, `a turn stalled (loop:${rt.loopHit}); aborting.`);
         return;
       }
@@ -716,7 +719,7 @@ export default (async function plugin(input, rawOptions) {
       if (stuck) {
         rt.recoveryCounter += 1;
         log("recovery attempt", rt.recoveryCounter, "of", eff.recovery_attempts);
-        if (rt.recoveryCounter > eff.recovery_attempts) {
+        if (!infinite && rt.recoveryCounter > eff.recovery_attempts) {
           pause(rt, `no progress after ${eff.recovery_attempts} recovery/research rounds.`);
           return;
         }
@@ -987,7 +990,7 @@ export default (async function plugin(input, rawOptions) {
       description: `Start or overwrite an autonomous objective that keeps running by itself. Requires goal. Optional per-run params: agent, max_turns(-1=infinite), recovery(auto-research/pause/continue), recovery_attempts, no_progress_turns, converge_turns, turn_timeout_s(silence timeout), idle_interval_ms. Multi-session/instance safe.`,
       args: {
         goal: z.string().describe("The concrete objective to pursue autonomously."),
-        mode: z.enum(["goal", "iterate"]).optional(),
+        mode: z.enum(["goal", "iterate", "infinite"]).optional().describe("goal=目标模式; iterate=迭代(收敛可停); infinite=无限迭代(无自动停, 仅手动停)"),
         agent: z.number().int().positive().optional(),
         max_turns: z.number().int().optional(),
         recovery: recoveryEnum.optional(),
@@ -1000,7 +1003,8 @@ export default (async function plugin(input, rawOptions) {
         idle_interval_ms: z.number().positive().optional(),
       },
       execute: async (args: any, ctx: any) => {
-        const mode: Exclude<Mode, "off"> = args.mode === "iterate" ? "iterate" : "goal";
+        const mode: Exclude<Mode, "off"> =
+          args.mode === "iterate" || args.mode === "infinite" ? args.mode : "goal";
         const rt = ensureRt(ctx.sessionID, ctx.worktree, ctx.directory, mode, args.goal);
         if (!rt.state.overrides) rt.state.overrides = {};
         applyOverrides(rt.state.overrides, args);
@@ -1008,7 +1012,7 @@ export default (async function plugin(input, rawOptions) {
         const eff = effConfig(rt);
         scheduleContinue(ctx.sessionID);
         return (
-          `Objective engine ${mode === "iterate" ? "ITERATE" : "GOAL"} started. Objective: ${args.goal}\n` +
+          `Objective engine ${mode === "iterate" ? "ITERATE" : mode === "infinite" ? "INFINITE (no auto-stop; stop only manually)" : "GOAL"} started. Objective: ${args.goal}\n` +
           `Effective config: agent=${eff.max_parallel_agents}, max_turns=${eff.max_auto_turns}, recovery=${eff.recovery}(${eff.recovery_attempts}), worktree=${eff.worktree_policy}(parallel=${eff.worktree_parallel_sessions}), ` +
           `no_progress_turns=${eff.no_progress_turns}, converge_turns=${eff.converge_turns}, silence_timeout=${eff.turn_timeout_s}s, idle_interval=${eff.idle_interval_ms}ms.\n` +
           `Engine runs automatically (shared safely across sessions/instances on this worktree). Use goal_progress/goal_mark_done/goal_configure/goal_pause.`

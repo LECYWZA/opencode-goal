@@ -6,7 +6,7 @@ import * as crypto from "node:crypto";
  * (opencode's loader can be confused by named class exports). This file
  * is also built separately for the concurrency tests. */
 
-export type Mode = "goal" | "iterate" | "off";
+export type Mode = "goal" | "iterate" | "infinite" | "off";
 export type Recovery = "auto-research" | "pause" | "continue";
 export type WorktreePolicy = "serial" | "parallel";
 
