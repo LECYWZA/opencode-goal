@@ -6,36 +6,90 @@
 
 ## 特性
 
-- **目标模式**：设定目标后 AI 自动持续工作，直到调用 `goal_mark_done` 给出可验证凭证才停止。
-- **无限迭代模式**：AI 反复「实现 → 自测 → 找差距 → 改进」，越做越好，直到收敛或你手动停。
+- **目标模式（goal）**：设定目标后 AI 自动持续工作，直到调用 `goal_mark_done` 给出可验证凭证才停止。
+- **迭代模式（iterate）**：AI 反复「实现 → 自测 → 找差距 → 改进」，越做越好，直到收敛（连续 `converge_turns` 轮无改进）或你手动停。
+- **无限模式（infinite）**：**永不自动停止**——忽略「连续 N 轮无进展」「恢复次数用尽」两类自动刹车，每轮注入铁律"不许因看似收敛就自行 `goal_mark_done`"；**只有手动停止**（`goal-cli` / `/my_goal_stop` / `/my_goal_delete` / 对话明确要求停）才会结束。不改变原有 goal/iterate 语义。
 - **并行 Agent 上限可配**：`max_parallel_agents`，你要 1 个就 1 个，要多可多（默认 1）。
 - **自我进化，拒绝固步自封**：无进展/卡住时**不停下**，而是自动分析原因 → 用 `goal_research`（聚合 Bing / Google / DuckDuckGo / Stack Overflow / GitHub / HuggingFace 搜索）查解法 → 换思路继续。（可选 `pause` 等旧行为）
 - **静默活性超时**：单轮只在模型长时间**完全无输出/无动作**时才判定超时（说话/干活都不算），超时自动中断该轮并进入"上一轮为何没进展"的诊断轮。
 - **多路停止**：可验证完成 / 手动 / 收敛 / 用户可选轮次上限 / 恢复尝试上限。绝不会死循环或无限空转。
-- **持久化 + 指令式恢复**：目标状态落盘，跨重启用 `/goal-restore` 检查未完成任务并询问是否继续。
+- **持久化 + 指令式恢复**：目标状态落盘，跨重启用 `/my_goal_restore`（**按当前目录优先**，弹全部候选选择）恢复。
+- **不经 AI 推理的管理通道（goal-cli）**：`~/.local/bin/goal-cli.cmd`（独立进程）提供 `list / status / pause / stop / delete / candidates`，写 `goal-run-stop-<id>.flag` 停止信号 → 插件在 schedule/continue 边界轮询并执行 goal_abort 式停机 → 再清持久化。完全绕过 LLM。
 - **防卡死机制**：单飞锁（同一时刻仅一个续跑在飞）+ 事件自驱动去抖，杜绝触发风暴。
 
-## 安装 / 启用
+## 安装 / 从零部署
+
+本仓库**只存源码**，`dist/` 不入库；任何环境（含另一台 opencode 自动拉取）安装流程如下：
 
 ```bash
-cd C:\Users\Administrator\opencode-goal-run
+# 1. 拉取源码（选一个远端）
+git clone git@github.com:LECYWZA/opencode-goal.git   # GitHub (SSH: ssh.github.com:443)
+# 或 git clone http://openwrt.nbplus.host:180/root/opencode-goal-run.git  # GitLab (HTTP token)
+
+# 2. 安装依赖并构建（build 生成 dist/index.js 插件；build:cli 生成 dist/cli.js 命令行）
+cd opencode-goal
 npm install
-npm run build      # 改源码后必须重新构建
+npm run build
+npm run build:cli
+
+# 3. 注册插件到 opencode（编辑 ~/.config/opencode/opencode.jsonc，plugin 数组加入）
+#    注意用绝对 file:// 路径指向 dist/index.js
+#    ["file:///C:/Users/Administrator/opencode-goal-run/dist/index.js", { ...配置见下... }]
+
+# 4. 安装管理命令文件：仓库内 `command/` 目录即为命令文件源（my_goal / my_iterate / my_infinite /
+#    my_goal_status / my_goal_stop / my_goal_delete / my_goal_edit / my_goal_restore）,
+#    拷贝到 ~/.config/opencode/command/：
+#    Copy-Item command/*.md C:\Users\<you>\.config\opencode\command\
+#    注意：命令统一调用 `goal-cli` 别名（第 5 步安装）；不装别名则把命令里的 `goal-cli`
+#    替换成 `node <此仓库绝对路径>/dist/cli.js`。
+
+# 5. 安装 goal-cli 别名（不经 AI 推理的 CLI 管理，可选但推荐）
+#    在 PATH 任一目录（如 ~/.local/bin）建 wrapper 指向 dist/cli.js：
+#    goal-cli.cmd  ->  @echo off + node "<绝对路径>\dist\cli.js" %*
+
+# 6. 重启 opencode（插件与命令只在启动时加载一次）
 ```
 
-构建产物在 `dist/index.js`。已注册到 `~/.config/opencode/opencode.jsonc` 的 `plugin` 数组（用绝对 `file://` 路径指向）。
+**改完源码 / 配置后必须重启 opencode 才生效**。构建命令：`npm run build`（插件）、`npm run build:cli`（CLI）、`npm run typecheck`（类型检查）。
 
-**改完源码 / 配置后必须重启 opencode 才生效**（opencode 启动时加载一次）。
+### 更新已有安装
+
+```bash
+git pull   # 分别从 github / origin 拉最新
+npm install
+npm run build && npm run build:cli
+# 同步 command/*.md（若有更新）；重启 opencode
+```
 
 ## 使用
 
 | 命令 | 作用 |
 |---|---|
-| `/my_goal 目标…` | 以目标模式启动，开始前弹选并行度/轮次等参数，自动续跑到完成 |
-| `/my_iterate 目标…` | 以迭代(自我优化)模式启动，自动反复改进到收敛 |
-| `/my_goal_restore` | 检查持久化的未完成任务，询问是否继续（跨重启恢复） |
+| `/my_goal 目标…` | 以【目标】模式启动，前弹选并行度/轮次等参数，自动续跑到完成 |
+| `/my_iterate 目标…` | 以【迭代】模式启动，自动反复改进到收敛 |
+| `/my_infinite 目标…` | 以【无限】模式启动，**永不自动停**，仅手动停（`/my_goal_stop`、`/my_goal_delete`、`goal-cli` 或对话要求） |
+| `/my_goal_status` | 查看任务状态（CLI 直读，不经 AI 推理） |
+| `/my_goal_stop <id/关键词> pause\|stop` | 停止：`pause`=暂停保留(可恢复) / `stop`=彻底终止(清状态)，CLI 直连 |
+| `/my_goal_delete <id/关键词>` | 先停再删（含历史遗留任务），CLI 直连 |
+| `/my_goal_edit <新目标或参数=值>` | 改目标/运行参数（goal_continue / goal_configure），目标回输入框直接填 |
+| `/my_goal_restore` | **按当前目录优先**，把全部候选弹成选项让你选，恢复跨重启的任务 |
 
-> 全部命令统一 `/my_` 前缀。也可不用命令，直接让模型调用 `goal_set` 工具。
+> 全部命令统一 `/my_` 前缀。也可不用命令，直接让模型调用 `goal_set` / `goal_configure` 等工具。
+
+### goal-cli（不经 AI 推理的管理通道）
+
+任意终端（安装后）直接使用：
+
+```bash
+goal-cli list                  # 查看全部持久化任务
+goal-cli status <关键词>        # 查看指定任务
+goal-cli candidates <cwd>      # 返回"当前项目优先/其它项目备选"的结构化恢复候选（供 restore 用）
+goal-cli pause <id|关键词>      # 暂停保留（可恢复）
+goal-cli stop <id|关键词>       # 彻底终止（清状态）
+goal-cli delete <id|关键词>     # 先停再删（含历史任务）
+```
+
+停止/删除原理：CLI 写 `goal-run-stop-<id>.flag` 停止信号并改/删持久化 → 插件在 schedule/continue 边界轮询到信号后按 `goal_abort` 标准流程完整停机（清 timer/watchdog、释放 worktree 锁、清/留状态），因此**不存在"引擎还在跑、状态却被删掉"的残留**。
 
 ## 运行时配置（不用改 config）
 
@@ -52,7 +106,7 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `mode` | `goal` | `goal` / `iterate` / `off`（全局默认，命令会按需覆盖） |
+| `mode` | `goal` | `goal` / `iterate` / `infinite` / `off`（全局默认，命令会按需覆盖；`infinite`=无限模式，仅手动停） |
 | `max_parallel_agents` | `1` | 同一时刻最多并行的 subagent(task) 数量 |
 | `max_auto_turns` | `-1` | 自动续跑轮次上限，`-1` = 无限 |
 | `turn_timeout_s` | `300` | **静默**超时秒数（模型在此期间无输出/动作才算超时；非整轮墙钟时长） |
@@ -88,9 +142,11 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 
 ## 如何停下来
 
-1. **手动**：输入 `停止` / `暂停` / `goal_pause`，立即暂停（状态保留，可用 `/my_goal_restore` 或 `goal_resume` 恢复）。
+> **无限模式（infinite）没有"收敛/无进展自动停"**，以下 2/3/4 条对它不生效；它只能通过第 1 条（手动）停止。
+
+1. **手动（推荐，不经 AI 推理）**：`goal-cli stop <id>` / `goal-cli delete <id>`，或 `/my_goal_stop <id> stop`、`/my_goal_delete <id>`；或对话里让模型 `goal_abort()` / `goal_pause()`。`pause` 保留状态可恢复，`stop`/`delete` 清状态。
 2. **目标完成**：模型调用 `goal_mark_done`（须附证据）→ 自动停；`human_gate` 开启时再等你确认是否深挖。
-3. **收敛**（迭代模式）：连续 `converge_turns` 轮无改进，或 `recovery_attempts` 恢复轮用尽 → 自动暂停。
+3. **收敛**（仅迭代）：连续 `converge_turns` 轮无改进，或 `recovery_attempts` 恢复轮用尽 → 自动暂停。
 4. **轮次上限**（启动时你选择）：达到 `max_auto_turns` → 暂停（不是终止，随时可续）。
 
 ## 执行流程（目标模式示例）
