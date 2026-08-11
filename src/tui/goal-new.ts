@@ -197,7 +197,7 @@ export function goalNewCommands(api: TuiPluginApi) {
   return [
     {
       name: "opencode-goal-run.goal-new",
-      title: "新建 Goal 任务（目标/固定迭代/无限，参数可选项或手输）",
+      title: "my_new · 新建 Goal 任务（目标/固定迭代/无限，参数可选项或手输）",
       category: "Goal",
       namespace: "palette",
       slashName: "my_new",

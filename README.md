@@ -26,31 +26,32 @@
 git clone git@github.com:LECYWZA/opencode-goal.git   # GitHub (SSH: ssh.github.com:443)
 # 或 git clone http://openwrt.nbplus.host:180/root/opencode-goal-run.git  # GitLab (HTTP token)
 
-# 2. 安装依赖并构建（build 生成 dist/index.js 插件；build:cli 生成 dist/cli.js 命令行）
+# 2. 安装依赖并构建（build=server 插件, build:tui=TUI 零模型管理, build:cli=命令行）
 cd opencode-goal
 npm install
 npm run build
+npm run build:tui
 npm run build:cli
 
-# 3. 注册插件到 opencode（编辑 ~/.config/opencode/opencode.jsonc，plugin 数组加入）
-#    注意用绝对 file:// 路径指向 dist/index.js
-#    ["file:///C:/Users/Administrator/opencode-goal-run/dist/index.js", { ...配置见下... }]
+# 3. (可选) 注册 goal 插件工具到 opencode server：编辑 ~/.config/opencode/opencode.jsonc 的 plugin 数组，
+#    用绝对 file:// 路径指向 dist/index.js（提供 goal_set/goal_status 等模型工具与自动运行引擎）
 
-# 4. 安装管理命令文件：仓库内 `command/` 目录即为命令文件源（my_goal / my_iterate / my_infinite /
-#    my_goal_status / my_goal_stop / my_goal_delete / my_goal_edit / my_goal_restore）,
-#    拷贝到 ~/.config/opencode/command/：
-#    Copy-Item command/*.md C:\Users\<you>\.config\opencode\command\
-#    注意：命令统一调用 `goal-cli` 别名（第 5 步安装）；不装别名则把命令里的 `goal-cli`
-#    替换成 `node <此仓库绝对路径>/dist/cli.js`。
+# 4. 注册 TUI 零模型管理插件：把 dist/tui.js 加入 ~/.config/opencode/tui.jsonc 的 "plugin" 数组：
+#    { "plugin": [ "C:/Users/<you>/opencode-goal-run/dist/tui.js" ] }
+#    提供 /my_new /my_goal_manager /my_sessions /my_goal_status/stop/delete/edit/restore（零模型），
+#    需 opencode 支持 TUI 插件机制（参考 opencode-tui-utils）
 
-# 5. 安装 goal-cli 别名（不经 AI 推理的 CLI 管理，可选但推荐）
-#    在 PATH 任一目录（如 ~/.local/bin）建 wrapper 指向 dist/cli.js：
+# 5. 创建命令文件（走模型，可选保留）：仓库内 command/ 目录现仅含 my_goal / my_iterate / my_infinite，
+#    拷贝到 ~/.config/opencode/command/；这些是"创建(用模型)"入口，管理已由 TUI 接管，
+#    不装也可（管理用 TUI/ goal-cli）
+
+# 6. 安装 goal-cli 别名（不经 AI 推理的 CLI 管理，推荐）：在 PATH 目录(如 ~/.local/bin)建 wrapper 指向 dist/cli.js：
 #    goal-cli.cmd  ->  @echo off + node "<绝对路径>\dist\cli.js" %*
 
-# 6. 重启 opencode（插件与命令只在启动时加载一次）
+# 7. 重启 opencode（插件/命令/tui.jsonc 只在启动时加载一次）
 ```
 
-**改完源码 / 配置后必须重启 opencode 才生效**。构建命令：`npm run build`（插件）、`npm run build:cli`（CLI）、`npm run typecheck`（类型检查）。
+**改完源码 / 配置后必须重启 opencode 才生效**。构建命令：`npm run build`（server）、`npm run build:tui`（TUI 零模型管理）、`npm run build:cli`（CLI）、`npm run typecheck`（类型检查）、`npm run test:tui`（TUI 冒烟）。
 
 ### 更新已有安装
 
@@ -63,35 +64,37 @@ npm run build && npm run build:cli
 
 ## TUI 插件（零模型管理，原生列表交互）
 
-任务**管理**走 TUI 组件、不依赖大模型（复用 goal-cli + state 文件作为脚本底座）。命令一律 `/my_` 前缀、出现在 `/` 命令列表：
+任务**管理**走 TUI 组件、不依赖大模型（复用 goal-cli + state 文件作为脚本底座）。命令一律 `/my_` 前缀、出现在 `/` 命令列表；大内容弹窗（详情/编辑/确认）会自动放大尺寸：
 
 | TUI 命令 | 作用 |
 |---|---|
 | `/my_new` | **创建向导**：输入目标 → 选 目标/固定迭代(自填次数,0=无限)/无限 → 参数逐项「选项 + 自定义输入」→ 确认后交给会话执行 `goal_set`（创建允许一次模型） |
-| `/my_goal_manager` | **任务管理面板**：按当前目录优先列出任务（原生选择菜单）→ 查看详情 / 暂停保留 / 彻底停止 / 先停再删 / 恢复 / 编辑目标，全部零模型执行 |
-| `/my_sessions` | **跨项目会话浏览**：拉取全部 session 按项目目录分组 → 选择即切换会话与目录 |
+| `/my_goal_manager` | **全局管理面板**：列出全部目录的任务（原生选择菜单）→ 查看/暂停/停止/先停再删/恢复/编辑，全部零模型 |
+| `/my_sessions` | **跨项目会话浏览**：拉取全部项目 session 按目录分组（`roots`）→ 选择即切换会话与目录 |
+| `/my_goal_status` | 查看**【当前会话】**的 Goal（只作用当前目录，不误触其它 session） |
+| `/my_goal_stop` | 停止**【当前会话】** Goal（暂停保留/彻底停止） |
+| `/my_goal_delete` | 先停再删**【当前会话】** Goal |
+| `/my_goal_edit` | 编辑**【当前会话】** Goal 目标（预填，改完落盘） |
+| `/my_goal_restore` | 恢复**【当前会话】** Goal（解除暂停/完成） |
+
+> 说明：上方 `status/stop/delete/edit/restore` 5 个命令为**当前会话专用**（按当前 worktree 匹配、零模型，避免误操作其它目录任务）；要管理/选择其它任务用 `/my_goal_manager`。这些入口由 TUI 插件提供；原同名 md 管理命令已移除。创建仍走对话 `/my_goal` `/my_iterate` `/my_infinite`（用模型）。
 
 安装步骤：
 1. 构建：`npm run build:tui` 生成 `dist/tui.js`；
 2. 在 `~/.config/opencode/tui.jsonc` 的 `"plugin"` 数组加入本地产物：`"C:/Users/<you>/opencode-goal-run/dist/tui.js"`；
 3. 重启 opencode（tui.jsonc 与插件仅启动时加载）。
 
-> 说明：TUI 插件机制、`/my_new`、`/my_goal_manager`、`/my_sessions` 需要 opencode 支持 **TUI 插件**（`tui.jsonc` 的 `plugin` 加载，参考成熟实现 opencode-tui-utils）。若目标版本不支持，改回用下方 `/my_goal` 等对话命令与 `goal-cli`（均可用）。原 `/my_goal`、`/my_iterate`、`/my_infinite`（创建）与 `/my_goal_status`/`/my_goal_stop`/`/my_goal_delete`/`/my_goal_edit`/`/my_goal_restore`（管理）作为**兜底**保留。
+> 兼容：TUI 插件机制（`tui.jsonc` 的 `plugin` 加载）需 opencode 支持（参照成熟实现 opencode-tui-utils）。若目标版本不加载外部 TUI 插件，退回用下方对话创建命令 + `goal-cli`（均可用）。
 
-## 使用
+## 使用（创建，走模型）
 
 | 命令 | 作用 |
 |---|---|
-| `/my_goal 目标…` | 以【目标】模式启动，前弹选并行度/轮次等参数，自动续跑到完成 |
+| `/my_goal 目标…` | 以【目标】模式启动，弹选并行度/轮次等参数，自动续跑到完成 |
 | `/my_iterate 目标…` | 以【迭代】模式启动，自动反复改进到收敛 |
-| `/my_infinite 目标…` | 以【无限】模式启动，**永不自动停**，仅手动停（`/my_goal_stop`、`/my_goal_delete`、`goal-cli` 或对话要求） |
-| `/my_goal_status` | 查看任务状态（CLI 直读，不经 AI 推理） |
-| `/my_goal_stop <id/关键词> pause\|stop` | 停止：`pause`=暂停保留(可恢复) / `stop`=彻底终止(清状态)，CLI 直连 |
-| `/my_goal_delete <id/关键词>` | 先停再删（含历史遗留任务），CLI 直连 |
-| `/my_goal_edit <新目标或参数=值>` | 改目标/运行参数（goal_continue / goal_configure），目标回输入框直接填 |
-| `/my_goal_restore` | **按当前目录优先**，把全部候选弹成选项让你选，恢复跨重启的任务 |
+| `/my_infinite 目标…` | 以【无限】模式启动，**永不自动停**，仅手动停（TUI `/my_goal_stop`、`/my_goal_manager`、`goal-cli` 或对话要求） |
 
-> 全部命令统一 `/my_` 前缀。也可不用命令，直接让模型调用 `goal_set` / `goal_configure` 等工具。
+> 创建以上三种目标可用模型；创建后的查看/停止/删除/修改/恢复都走 TUI `/my_goal_*` 或 `goal-cli`（不依赖模型）。
 
 ### goal-cli（不经 AI 推理的管理通道）
 
@@ -161,7 +164,7 @@ config 里的参数只是**全局默认值**。每个任务实际生效的参数
 
 > **无限模式（infinite）没有"收敛/无进展自动停"**，以下 2/3/4 条对它不生效；它只能通过第 1 条（手动）停止。
 
-1. **手动（推荐，不经 AI 推理）**：`goal-cli stop <id>` / `goal-cli delete <id>`，或 `/my_goal_stop <id> stop`、`/my_goal_delete <id>`；或对话里让模型 `goal_abort()` / `goal_pause()`。`pause` 保留状态可恢复，`stop`/`delete` 清状态。
+1. **手动（推荐，不经 AI 推理）**：TUI `/my_goal_stop`（当前会话）、`/my_goal_manager`（任意任务）、或 `goal-cli stop <id>` / `goal-cli delete <id>`；亦可对话里让模型 `goal_abort()` / `goal_pause()`。`pause` 保留状态可恢复，`stop`/`delete` 清状态。
 2. **目标完成**：模型调用 `goal_mark_done`（须附证据）→ 自动停；`human_gate` 开启时再等你确认是否深挖。
 3. **收敛**（仅迭代）：连续 `converge_turns` 轮无改进，或 `recovery_attempts` 恢复轮用尽 → 自动暂停。
 4. **轮次上限**（启动时你选择）：达到 `max_auto_turns` → 暂停（不是终止，随时可续）。

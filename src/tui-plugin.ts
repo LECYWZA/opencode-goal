@@ -1,11 +1,13 @@
 /**
  * opencode-goal-run — TUI plugin entry (client-side, zero LLM for management;
  * only assigning a running engine hands a goal_set(...) back to the session).
- * Registers /my_new, /my_goal_manager, /my_sessions.
+ * Registers /my_new, /my_goal_manager, current-session managers
+ * (/my_goal_status|stop|delete|edit|restore) and /my_sessions.
  */
 import type { TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { goalNewCommands } from "./tui/goal-new"
 import { goalManagerCommands } from "./tui/goal-manager"
+import { goalCurrentCommands } from "./tui/goal-current"
 import { sessionsCommands } from "./tui/sessions"
 
 const plugin: TuiPluginModule & { id: string } = {
@@ -13,6 +15,7 @@ const plugin: TuiPluginModule & { id: string } = {
   async tui(api) {
     const commands = [
       ...goalNewCommands(api),
+      ...goalCurrentCommands(api),
       ...goalManagerCommands(api),
       ...sessionsCommands(api),
     ]

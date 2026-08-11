@@ -53,6 +53,7 @@ function showActions(api: TuiPluginApi, id: string): void {
     { title: "解除暂停 / 标记继续", value: "resume" },
     { title: "编辑目标", value: "edit" },
   ]
+  api.ui.dialog.setSize("medium")
   api.ui.dialog.replace(() =>
     api.ui.DialogSelect({
       title: `操作任务 ${short(id)}`,
@@ -68,6 +69,7 @@ function showActions(api: TuiPluginApi, id: string): void {
 function dispatchAction(api: TuiPluginApi, id: string, action: string): void {
   switch (action) {
     case "detail": {
+      api.ui.dialog.setSize("xlarge")
       api.ui.dialog.replace(() =>
         api.ui.DialogAlert({ title: `任务详情 ${short(id)}`, message: describeGoal(id), })
       )
@@ -132,6 +134,7 @@ function dispatchAction(api: TuiPluginApi, id: string, action: string): void {
     }
     case "edit": {
       const cur = (readState()[id]?.objective ?? "") as string
+      api.ui.dialog.setSize("large")
       api.ui.dialog.replace(() =>
         api.ui.DialogPrompt({
           title: `编辑目标（${short(id)}）`,
@@ -158,11 +161,12 @@ export function goalManagerCommands(api: TuiPluginApi) {
   return [
     {
       name: "opencode-goal-run.goal-manager",
-      title: "Goal 管理面板（查看/暂停/停止/删除/编辑）",
+      title: "my_goal_manager · Goal 管理面板（查看/暂停/停止/删除/编辑）",
       category: "Goal",
       namespace: "palette",
       slashName: "my_goal_manager",
-      async run() {
+      run() {
+        api.ui.dialog.setSize("medium")
         const { current, elsewhere } = candidates(api)
         const options = [
           ...current.map((r) => ({ title: `${r.label}（当前目录）`, value: r.id, description: r.description })),

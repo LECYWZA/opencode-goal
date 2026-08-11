@@ -22,13 +22,22 @@ function toast(api: TuiPluginApi, variant: "info" | "success" | "warning" | "err
   api.ui.toast({ variant, title, message })
 }
 
-/** Try every plausible SDK surface to list sessions across projects. */
+/** Try every plausible SDK surface to list sessions across ALL projects. */
 async function listSessions(api: TuiPluginApi): Promise<Sess[]> {
   const c = api.client as any
   const probes: Array<[string, () => Promise<unknown>]> = []
-  if (c?.session?.list && typeof c.session.list === "function") probes.push(["session.list", () => c.session.list()])
-  if (c?.V2SessionList && typeof c.V2SessionList === "function") probes.push(["V2SessionList", () => c.V2SessionList()])
-  if (c?.listSessions && typeof c.listSessions === "function") probes.push(["listSessions", () => c.listSessions()])
+  const proj = { roots: true as boolean | "true" | "false", scope: "project" as const }
+  if (c?.session?.list && typeof c.session.list === "function") {
+    probes.push(["session.list(roots)", () => c.session.list({ query: proj })])
+    probes.push(["session.list()", () => c.session.list()])
+  }
+  if (c?.V2SessionList && typeof c.V2SessionList === "function") {
+    probes.push(["V2SessionList(roots)", () => c.V2SessionList({ query: proj })])
+    probes.push(["V2SessionList()", () => c.V2SessionList()])
+  }
+  if (c?.listSessions && typeof c.listSessions === "function") {
+    probes.push(["listSessions()", () => c.listSessions(proj)])
+  }
   for (const [, fn] of probes) {
     try {
       const r = await fn()
@@ -42,7 +51,7 @@ async function listSessions(api: TuiPluginApi): Promise<Sess[]> {
         .map((x: any) => ({
           id: String(x?.id ?? ""),
           title: String(x?.title ?? x?.slug ?? ""),
-          directory: String(x?.directory ?? x?.path ?? ""),
+          directory: String(x?.directory ?? x?.path ?? x?.projectID ?? ""),
           projectID: String(x?.projectID ?? ""),
           agent: x?.agent ? String(x.agent) : undefined,
           model: x?.model?.id ? String(x.model.id) : x?.model ? String(x.model) : undefined,
@@ -130,7 +139,7 @@ export function sessionsCommands(api: TuiPluginApi) {
   return [
     {
       name: "opencode-goal-run.sessions",
-      title: "跨项目会话浏览/切换（按目录分组）",
+      title: "my_sessions · 跨项目会话浏览/切换（按目录分组）",
       category: "Session",
       namespace: "palette",
       slashName: "my_sessions",
