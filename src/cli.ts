@@ -151,6 +151,49 @@ function mutate(query: string | undefined, mode: "pause" | "delete", reason?: st
   return 0;
 }
 
+function normalizePath(p: string): string {
+  return (p || "").replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+/** candidates <cwd> — structured restore candidate list, current-project first. */
+function cmdCandidates(cwd: string): number {
+  const state = readState();
+  const rows = Object.entries(state);
+  const cwdN = normalizePath(cwd);
+  const bucket = (s: any): "current" | "elsewhere" => {
+    const wt = normalizePath(s.worktree ?? "");
+    if (!cwdN) return "elsewhere";
+    if (wt === cwdN) return "current";
+    if (wt.startsWith(cwdN + "\\") || cwdN.startsWith(wt + "\\")) return "current"; // parent/child project tree
+    return "elsewhere";
+  };
+  const current: any[] = [];
+  const elsewhere: any[] = [];
+  for (const [id, s] of rows) {
+    const rec = {
+      id,
+      mode: s.mode ?? "?",
+      worktree: s.worktree ?? "",
+      turns: s.turns ?? 0,
+      paused: s.paused ?? false,
+      completed: s.completed ?? false,
+      objective: (s.objective ?? "").slice(0, 400),
+      overrides: s.overrides ?? {},
+    };
+    const label = `${id.length > 14 ? id.slice(0, 14) + "…" : id} :: ${(s.worktree ?? "").split("\\").pop() ?? "?"}`;
+    const status = [];
+    if (s.paused) status.push("paused");
+    if (s.completed) status.push("completed");
+    (bucket(s) === "current" ? current : elsewhere).push({
+      ...rec,
+      label,
+      description: `[${rec.mode ?? "?"}${status.length ? "/" + status.join("/") : ""} turns=${rec.turns}] ${rec.worktree}\n${rec.objective}`,
+    });
+  }
+  console.log(JSON.stringify({ cwd, current, elsewhere }, null, 2));
+  return 0;
+}
+
 const args = process.argv.slice(2).filter((a) => !a.startsWith("--state="));
 const cmd = (args[0] ?? "").toLowerCase();
 
@@ -161,6 +204,9 @@ const query = args.slice(1).find((a) => !a.startsWith("--"));
 
 let exit = 0;
 switch (cmd) {
+  case "candidates":
+    exit = cmdCandidates(query ?? "");
+    break;
   case "list":
   case "status":
   case "ls":
@@ -176,12 +222,12 @@ switch (cmd) {
     exit = mutate(query, "delete", reason);
     break;
   case "":
-    console.log("usage: goal-cli <list|pause|stop|delete> [id|match] [--reason=...] [--state=<file>]");
+    console.log("usage: goal-cli <list|candidates <cwd>|pause|stop|delete> [id|match] [--reason=...] [--state=<file>]");
     exit = 1;
     break;
   default:
     console.log(`unknown command: ${cmd}`);
-    console.log("usage: goal-cli <list|pause|stop|delete> [id|match] [--reason=...] [--state=<file>]");
+    console.log("usage: goal-cli <list|candidates <cwd>|pause|stop|delete> [id|match] [--reason=...] [--state=<file>]");
     exit = 1;
 }
 process.exit(exit);
