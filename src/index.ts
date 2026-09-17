@@ -937,35 +937,41 @@ export default (async function plugin(input, rawOptions) {
 
   function ensureRt(sessionID: string, worktree: string, directory: string, mode: Exclude<Mode, "off">, objective: string): Runtime {
     let rt = getRuntime(sessionID);
-    if (rt) {
-      rt.state.mode = mode;
-      rt.state.objective = objective;
-      rt.state.paused = false;
-      rt.state.completed = false;
-      rt.state.pausedReason = undefined;
-      rt.state.completedReason = undefined;
-      rt.state.turns = 0;
-      rt.state.noProgressTurns = 0;
-      rt.state.progressLog = [];
-      rt.recoveryCounter = 0;
-      rt.lastEnd = "ok";
-      return rt;
+    if (!rt) {
+      // Cross-restart resume: reuse a persisted incomplete objective instead of
+      // starting a blank one (keeps turns/progressLog/noProgressTurns/overrides
+      // so re-attaching with goal_set after a restart never loses history).
+      const existing = store.get(sessionID);
+      if (existing) {
+        rt = createRuntime(existing);
+      } else {
+        const state: GoalState = {
+          sessionID,
+          worktree,
+          directory,
+          mode,
+          objective,
+          startedAt: Date.now(),
+          completed: false,
+          paused: false,
+          turns: 0,
+          lastActivityAt: Date.now(),
+          noProgressTurns: 0,
+          progressLog: [],
+        };
+        rt = createRuntime(state);
+      }
     }
-    const state: GoalState = {
-      sessionID,
-      worktree,
-      directory,
-      mode,
-      objective,
-      startedAt: Date.now(),
-      completed: false,
-      paused: false,
-      turns: 0,
-      lastActivityAt: Date.now(),
-      noProgressTurns: 0,
-      progressLog: [],
-    };
-    rt = createRuntime(state);
+    rt.state.mode = mode;
+    rt.state.objective = objective;
+    rt.state.worktree = worktree;
+    rt.state.directory = directory;
+    rt.state.paused = false;
+    rt.state.completed = false;
+    rt.state.pausedReason = undefined;
+    rt.state.completedReason = undefined;
+    rt.recoveryCounter = 0;
+    rt.lastEnd = "ok";
     persist(rt);
     return rt;
   }
@@ -1049,7 +1055,10 @@ export default (async function plugin(input, rawOptions) {
       description: `Log progress / an improvement increment, signal the engine to keep going (resets no-progress & recovery counters).`,
       args: {
         note: z.string().describe("What was accomplished or improved this round."),
-        improved: z.boolean().optional().describe("For iterate mode: true if this round produced a real improvement."),
+        improved: z
+          .union([z.boolean(), z.enum(["true", "false"])])
+          .optional()
+          .describe("For iterate mode: true if this round produced a real improvement. (Also accepts string \"true\"/\"false\".)"),
       },
       execute: async (args: any, ctx: any) => {
         const rt = getRuntime(ctx.sessionID);
@@ -1062,7 +1071,11 @@ export default (async function plugin(input, rawOptions) {
         rt.activity += 1;
         rt.lastActivity = Date.now();
         persist(rt);
-        return `Progress logged (improved=${args.improved === true}). Keep going.`;
+        const improved =
+          args.improved === true || (typeof args.improved === "string" && args.improved.toLowerCase() === "true");
+        return rt.state.mode === "iterate"
+          ? `Progress logged (improved=${improved}). Keep going.`
+          : "Progress logged. Keep going.";
       },
     },
 
@@ -1335,6 +1348,25 @@ export default (async function plugin(input, rawOptions) {
       },
     },
   };
+
+  // Cross-restart resume: any persisted incomplete objective whose owning
+  // session is no longer live in this process gets a runtime rebuilt from disk
+  // so the auto-loop keeps advancing after an opencode restart. Paused /
+  // completed objectives stay untouched until goal_resume / goal_mark_done.
+  const reseed = () => {
+    let n = 0;
+    for (const s of store.all()) {
+      if (s.completed || s.paused) continue;
+      if (runtimes.has(s.sessionID)) continue;
+      const rt = createRuntime(s);
+      rt.lastEnd = "ok";
+      n += 1;
+      log("reseeded objective", s.sessionID, "turns", s.turns);
+      scheduleContinue(s.sessionID);
+    }
+    if (n > 0) log("reseed: rebuilt", n, "runtime(s) from disk");
+  };
+  reseed();
 
   return {
     event: onEvent,
